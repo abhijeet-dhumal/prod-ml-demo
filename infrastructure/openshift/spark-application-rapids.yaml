@@ -1,8 +1,31 @@
 ---
-# RAPIDS GPU-Accelerated Feature Engineering Job
-# Optional variant of smartshop-feature-engineering using RAPIDS JAR injection.
-# Base image: docker.io/apache/spark:3.5.3 + rapids-4-spark 26.02.2 (cuda12).
-# Requires GPU-equipped executor nodes with NVIDIA device plugin.
+# RAPIDS GPU-Accelerated Feature Engineering
+#
+# HOW IT WORKS
+#   rapids-4-spark JAR is pre-placed in /opt/spark/jars/ (auto-loaded at startup).
+#   The SQLPlugin intercepts every DataFrame operation — groupBy/agg/join/count —
+#   and executes them on GPU instead of CPU. No code changes to feature_engineering.py.
+#
+# CLUSTER: 2 × A100-80GB nodes (8 GPUs each = 16 total)
+# IMAGE  : apache/spark:3.5.3 base + rapids-4-spark 26.02.2 (cuda12 JAR)
+# CUDA   : cluster runs CUDA 13.0; cuda12 JAR works via NVIDIA backward compat
+#
+# EXECUTOR COUNT GUIDE
+#   4  → default (safe for both 1M sample and full 571M dataset)
+#   8  → fills both nodes (4 × A100 each), use if ETL is on Summit critical path
+#   16 → all GPUs, only worth it for repeated full runs
+#   Set via: SPARK_EXECUTOR_INSTANCES=8 envsubst < ... | oc apply -f -
+#
+# WHAT GETS GPU-ACCELERATED (automatically, no code changes)
+#   ✓ groupBy + agg (avg, count, stddev, sum, countDistinct)
+#   ✓ join (user-item join with metadata)
+#   ✓ sort / shuffle
+#   ✗ UDFs, input_file_name(), Python-side sentence-transformers
+#     → embedding_generation.py still runs on the regular spark-jobs image (CPU/GPU via HF)
+#
+# RAPIDS IS NOT USED FOR
+#   text_preprocessing.py  — string tokenization, no SQL aggregation
+#   embedding_generation.py — sentence-transformers, runs on spark-jobs image
 apiVersion: sparkoperator.k8s.io/v1beta2
 kind: SparkApplication
 metadata:
@@ -59,9 +82,10 @@ spec:
           name: smartshop-credentials
   executor:
     cores: ${SPARK_EXECUTOR_CORES:-4}
-    # Use 8 executors (1 GPU each) across both A100 nodes — 4 per node × 2 nodes.
-    # Reduce to 4 for sample data (1M reviews). Bump to 16 for full 571M dataset.
-    instances: ${SPARK_EXECUTOR_INSTANCES:-8}
+    # 4 executors (1 GPU each) — safe default for both sample and full dataset.
+    # Each executor gets 1 A100-80GB; 4 × 80GB = 320GB GPU memory total.
+    # Bump to 8 (full node pair) or 16 (all GPUs) only if ETL time matters at Summit.
+    instances: ${SPARK_EXECUTOR_INSTANCES:-4}
     memory: "${SPARK_EXECUTOR_MEMORY:-8g}"
     gpu:
       name: "nvidia.com/gpu"
