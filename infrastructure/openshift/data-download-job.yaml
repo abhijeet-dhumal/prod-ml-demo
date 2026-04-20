@@ -1,0 +1,192 @@
+---
+# Data Download Job — streams Amazon Reviews 2023 from HuggingFace Hub directly to MinIO.
+#
+# WHY ON-CLUSTER:
+#   The full Electronics JSONL alone is ~22GB — too large to cache locally.
+#   Streaming HF → MinIO on-cluster avoids local disk and is ~3× faster (datacenter bandwidth).
+#
+# WHAT IT DOES:
+#   Streams raw/review_categories/{Category}.jsonl from HuggingFace line-by-line,
+#   converts to Parquet in 100K-row chunks, writes directly to MinIO via s3fs.
+#   Reviews → s3://smartshop-raw/raw/reviews/{Category}.parquet
+#   Metadata → s3://smartshop-raw/raw/metadata/{Category}_meta.parquet
+#
+# IMAGE: spark-jobs (UBI9/Python 3.12) — ships datasets, huggingface_hub, pandas, pyarrow, s3fs
+#
+# USAGE:
+#   /bin/bash -c 'set -a; source .env; set +a; envsubst < infrastructure/openshift/data-download-job.yaml | oc apply -f -'
+#   oc logs -n smartshop -f job/smartshop-data-download
+#
+# MODE:
+#   Set DATA_DOWNLOAD_MODE=sample (~333K reviews/category, ~500MB, fast)
+#               or =full   (all reviews, ~49GB, use before Summit recording)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: smartshop-data-download
+  namespace: ${NAMESPACE}
+  labels:
+    app: smartshop
+    component: data-pipeline
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: downloader
+          image: ${SPARK_JOBS_IMAGE}
+          imagePullPolicy: Always
+          command: [python3, /opt/download/download_to_minio.py]
+          env:
+            - name: DATA_DOWNLOAD_MODE
+              value: "sample"   # override to "full" for Summit recording
+            - name: CATEGORIES
+              value: "Electronics,Books,Home_and_Kitchen"
+            - name: SAMPLE_PER_CATEGORY
+              value: "333334"   # ~1M reviews total for sample mode
+            - name: META_SAMPLE
+              value: "50000"
+          envFrom:
+            - secretRef:
+                name: smartshop-credentials   # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, MINIO_ENDPOINT
+            - secretRef:
+                name: hf-credentials          # token → HF_TOKEN
+          volumeMounts:
+            - name: download-script
+              mountPath: /opt/download
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+      volumes:
+        - name: download-script
+          configMap:
+            name: smartshop-download-script
+            defaultMode: 0755
+---
+# ConfigMap embeds the download script so the Job is fully self-contained.
+# Update the script here if the HuggingFace dataset layout changes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smartshop-download-script
+  namespace: ${NAMESPACE}
+  labels:
+    app: smartshop
+    component: data-pipeline
+data:
+  download_to_minio.py: |
+    """Stream Amazon Reviews 2023 from HuggingFace directly to MinIO.
+
+    Reads env vars:
+      DATA_DOWNLOAD_MODE  sample | full
+      CATEGORIES          comma-separated list
+      SAMPLE_PER_CATEGORY rows per category (sample mode)
+      META_SAMPLE         metadata rows per category (sample mode)
+      HF_TOKEN            HuggingFace read token (from hf-credentials secret)
+      AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / MINIO_ENDPOINT (from smartshop-credentials)
+
+    Dataset layout (McAuley-Lab/Amazon-Reviews-2023):
+      raw/review_categories/{Category}.jsonl       <- reviews (streamed line-by-line)
+      raw_meta_{Category}/full-*.parquet           <- metadata (Parquet shards)
+    """
+
+    import io, json, os, time
+    from pathlib import PurePosixPath
+
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import s3fs
+    from datasets import load_dataset
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    DATASET   = "McAuley-Lab/Amazon-Reviews-2023"
+    HF_TOKEN  = os.environ.get("HF_TOKEN") or os.environ.get("token")
+    MODE      = os.environ.get("DATA_DOWNLOAD_MODE", "sample")
+    CATEGORIES = os.environ.get("CATEGORIES", "Electronics,Books,Home_and_Kitchen").split(",")
+    SAMPLE_N  = int(os.environ.get("SAMPLE_PER_CATEGORY", 333334))
+    META_N    = int(os.environ.get("META_SAMPLE", 50000))
+
+    MINIO_ENDPOINT = os.environ["MINIO_ENDPOINT"].replace("http://", "").replace("https://", "")
+    S3_BUCKET = "smartshop-raw"
+
+    fs = s3fs.S3FileSystem(
+        key=os.environ["AWS_ACCESS_KEY_ID"],
+        secret=os.environ["AWS_SECRET_ACCESS_KEY"],
+        endpoint_url=f"http://{MINIO_ENDPOINT}",
+        use_ssl=False,
+    )
+
+
+    def write_parquet_to_s3(df: pd.DataFrame, s3_path: str) -> None:
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        buf = io.BytesIO()
+        pq.write_table(table, buf)
+        buf.seek(0)
+        with fs.open(s3_path, "wb") as f:
+            f.write(buf.read())
+
+
+    def download_reviews(category: str) -> None:
+        t0 = time.time()
+        hf_url = f"hf://datasets/{DATASET}/raw/review_categories/{category}.jsonl"
+        print(f"[{category}] streaming reviews ({MODE}) from {hf_url} ...")
+        max_rows = SAMPLE_N if MODE == "sample" else None
+        ds = load_dataset("json", data_files={"full": hf_url}, split="full",
+                          streaming=True, token=HF_TOKEN)
+        rows, total = [], 0
+        for row in ds:
+            rows.append(row)
+            total += 1
+            if max_rows and total >= max_rows:
+                break
+            if total % 50_000 == 0:
+                print(f"  [{category}] {total:,} rows streamed...")
+
+        df = pd.DataFrame(rows)
+        dest = f"{S3_BUCKET}/raw/reviews/{category}.parquet"
+        write_parquet_to_s3(df, dest)
+        elapsed = time.time() - t0
+        print(f"  [{category}] {len(df):,} reviews → s3://{dest}  ({elapsed:.1f}s, {len(df)/elapsed:,.0f} rows/s)")
+
+
+    def download_metadata(category: str) -> None:
+        t0 = time.time()
+        all_files = list(list_repo_files(DATASET, repo_type="dataset", token=HF_TOKEN))
+        shards = sorted(f for f in all_files
+                        if f.startswith(f"raw_meta_{category}/") and f.endswith(".parquet"))
+        if not shards:
+            print(f"  [{category}] no metadata shards found — skipping")
+            return
+
+        frames, collected = [], 0
+        for shard in shards:
+            local = hf_hub_download(repo_id=DATASET, filename=shard,
+                                    repo_type="dataset", token=HF_TOKEN)
+            df = pd.read_parquet(local)
+            if MODE == "sample":
+                df = df.head(max(0, META_N - collected))
+            frames.append(df)
+            collected += len(df)
+            if MODE == "sample" and collected >= META_N:
+                break
+
+        result = pd.concat(frames, ignore_index=True)
+        dest = f"{S3_BUCKET}/raw/metadata/{category}_meta.parquet"
+        write_parquet_to_s3(result, dest)
+        elapsed = time.time() - t0
+        print(f"  [{category}] {len(result):,} metadata rows → s3://{dest}  ({elapsed:.1f}s)")
+
+
+    if __name__ == "__main__":
+        print(f"=== SmartShop Data Download | mode={MODE} | categories={CATEGORIES} ===")
+        for cat in CATEGORIES:
+            download_reviews(cat)
+            download_metadata(cat)
+        print("=== Download complete ===")

@@ -882,57 +882,98 @@ REC_SERVER_IMAGE=quay.io/abdhumal/smartshop-rec-server:latest
 
 ## 11. Run Spark ETL (Feature Engineering)
 
-> **Prerequisite:** Data must be uploaded to `s3://smartshop-raw/raw/` before submitting.
-> See data download step below. Images are already built ✅.
+> **Prerequisite:** Data must land in `s3://smartshop-raw/raw/reviews/` and `raw/metadata/` first.
+> Images are already built ✅. Run the download Job below — it streams HF → MinIO directly,
+> no local disk required.
+
+### 11a — Download data on-cluster (recommended)
+
+Instead of downloading locally and uploading, run a Kubernetes Job that streams from
+HuggingFace directly into MinIO. Avoids local disk/bandwidth entirely.
 
 ```bash
-# Download dataset (~1M reviews per category, streaming — no full file cache)
-python data/download.py --mode sample       # dev/demo: ~1M reviews, ~500MB
-# python data/download.py --mode full       # Summit full run: 49GB (run on cluster)
-```
+# Submit the download Job (streams ~1M reviews/category in sample mode, ~500MB total)
+/bin/bash -c 'set -a; source .env; set +a; envsubst < infrastructure/openshift/data-download-job.yaml | oc apply -f -'
 
-Upload reviews and metadata to separate prefixes (the Spark jobs expect this layout):
+# Tail logs
+oc logs -n smartshop -f job/smartshop-data-download
 
-```bash
+# Verify data landed
 source .env
 S3=https://$(oc get route minio-s3 -n smartshop -o jsonpath='{.spec.host}')
-
-# Reviews → raw/reviews/  |  Metadata → raw/metadata/
-for f in data/sample/*.parquet; do
-  name=$(basename "$f")
-  if [[ "$name" == *_meta.parquet ]]; then
-    AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" \
-      aws s3 cp "$f" s3://smartshop-raw/raw/metadata/"$name" --endpoint-url $S3 --no-verify-ssl
-  else
-    AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" \
-      aws s3 cp "$f" s3://smartshop-raw/raw/reviews/"$name" --endpoint-url $S3 --no-verify-ssl
-  fi
-done
+AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" \
+  aws s3 ls s3://smartshop-raw/raw/reviews/ --endpoint-url $S3 --no-verify-ssl
 ```
 
-**GPU path (A100s, recommended):** Uses RAPIDS-accelerated Spark — `groupBy/agg/join` run on GPU. 8 executors × 1 A100 each across 2 nodes:
+To run full dataset (49GB) for the Summit recording, patch the Job's env before apply:
 
 ```bash
-# feature engineering (RAPIDS GPU)
-/bin/bash -c 'set -a; source .env; set +a; envsubst < infrastructure/openshift/spark-application-rapids.yaml | oc apply -f -'
+# Full mode — delete sample Job first, patch env, resubmit
+oc delete job smartshop-data-download -n smartshop
+# Edit DATA_DOWNLOAD_MODE: full in infrastructure/openshift/data-download-job.yaml
+/bin/bash -c 'set -a; source .env; set +a; envsubst < infrastructure/openshift/data-download-job.yaml | oc apply -f -'
 ```
 
-**CPU path (fallback):** All three jobs — feature engineering + text preprocessing + embeddings:
+### 11b — RAPIDS GPU vs CPU baseline (A/B comparison for demo)
+
+The driver logs emit structured `[METRIC]` lines for easy comparison. The canonical Summit story:
+*"Same Python code, same manifest — swap one image and the RAPIDS plugin handles the rest."*
+
+**Step 1 — CPU baseline:**
+
+```bash
+/bin/bash -c 'set -a; source .env; set +a; \
+  envsubst < infrastructure/openshift/spark-application-cpu-baseline.yaml | oc apply -f -'
+
+# Wait for completion, then capture metrics
+CPU_DRIVER=$(oc get pod -n smartshop -l spark-app-name=smartshop-feature-engineering-cpu-baseline,spark-role=driver -o name)
+oc logs -n smartshop $CPU_DRIVER | grep METRIC
+# [METRIC] gpu_accelerated=False
+# [METRIC] total_elapsed_s=<N> s
+# [METRIC] throughput_rows_per_s=<N> rows/s
+```
+
+**Step 2 — RAPIDS GPU:**
+
+```bash
+/bin/bash -c 'set -a; source .env; set +a; \
+  envsubst < infrastructure/openshift/spark-application-rapids.yaml | oc apply -f -'
+
+GPU_DRIVER=$(oc get pod -n smartshop -l spark-app-name=smartshop-feature-engineering-rapids,spark-role=driver -o name)
+oc logs -n smartshop $GPU_DRIVER | grep METRIC
+# [METRIC] gpu_accelerated=True
+# [METRIC] total_elapsed_s=<M> s   ← should be significantly lower
+# [METRIC] throughput_rows_per_s=<M> rows/s
+```
+
+**GPU utilization (DCGM — already scraped by OCP monitoring):**
+
+```bash
+# Query from the OCP Observe → Metrics console, or:
+oc exec -n smartshop deploy/prometheus-k8s -- \
+  curl -sg 'http://localhost:9090/api/v1/query?query=DCGM_FI_DEV_GPU_UTIL' | \
+  python3 -c "import sys,json; [print(m['metric']['gpu'], m['value'][1]) for m in json.load(sys.stdin)['data']['result']]"
+```
+
+**Spark UI (shows GPU operators in the DAG):**
+
+```bash
+# Port-forward the Spark UI from the running driver pod
+oc port-forward -n smartshop $GPU_DRIVER 4040:4040
+# Open http://localhost:4040 → SQL/DataFrame tab → look for GpuHashAggregateExec
+```
+
+**CPU path (full pipeline — text preprocessing + embeddings):**
 
 ```bash
 /bin/bash -c 'set -a; source .env; set +a; envsubst < infrastructure/openshift/spark-application.yaml | oc apply -f -'
 ```
 
-**Monitor:**
+**Monitor any job:**
 
 ```bash
-oc get sparkapplication smartshop-feature-engineering -n smartshop
-# NAME                             STATUS      ATTEMPTS   START                  FINISH
-# smartshop-feature-engineering   COMPLETED   1          2026-xx-xx             2026-xx-xx
-
-# Driver logs
-oc logs -n smartshop \
-  $(oc get pod -n smartshop -l spark-role=driver -o name) --follow
+oc get sparkapplication -n smartshop
+oc logs -n smartshop -f $(oc get pod -n smartshop -l spark-role=driver -o name | head -1)
 ```
 
 When the job completes, the following MinIO buckets will be populated with Parquet files:

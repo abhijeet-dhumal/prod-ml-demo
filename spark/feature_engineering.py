@@ -14,10 +14,17 @@ Usage:
 """
 
 import argparse
+import time
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+
+
+def _log_metric(label: str, value, unit: str = "") -> None:
+    """Emit a structured metric line for easy grep in pod logs and Spark history."""
+    unit_str = f" {unit}" if unit else ""
+    print(f"[METRIC] {label}={value}{unit_str}")
 
 
 def create_spark_session(app_name: str = "SmartShop-FeatureEngineering") -> SparkSession:
@@ -105,6 +112,16 @@ def compute_interactions(reviews_df):
     )
 
 
+def _rapids_active(spark: SparkSession) -> bool:
+    """Return True if the RAPIDS SQL plugin is loaded and enabled."""
+    try:
+        plugins = spark.conf.get("spark.plugins", "")
+        enabled = spark.conf.get("spark.rapids.sql.enabled", "false")
+        return "com.nvidia.spark.SQLPlugin" in plugins and enabled.lower() == "true"
+    except Exception:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="Input path (S3 or local)")
@@ -112,9 +129,16 @@ def main():
     parser.add_argument("--metadata-input", default=None, help="Metadata parquet path")
     args = parser.parse_args()
 
+    job_start = time.time()
     spark = create_spark_session()
 
+    gpu_mode = _rapids_active(spark)
+    _log_metric("gpu_accelerated", gpu_mode)
+    _log_metric("spark_app_name", spark.sparkContext.appName)
+    print(f"GPU/RAPIDS acceleration: {'ON' if gpu_mode else 'OFF (CPU mode)'}")
+
     print(f"Reading reviews from {args.input}")
+    read_start = time.time()
     reviews_df = spark.read.parquet(args.input)
 
     # Normalize column names
@@ -139,7 +163,10 @@ def main():
 
     reviews_df.cache()
     total_reviews = reviews_df.count()
+    read_elapsed = time.time() - read_start
     print(f"Total reviews: {total_reviews:,}")
+    _log_metric("total_reviews", total_reviews)
+    _log_metric("read_elapsed_s", round(read_elapsed, 2), "s")
 
     # Load metadata if provided
     metadata_df = None
@@ -149,22 +176,49 @@ def main():
 
     # Compute features
     print("Computing user features...")
+    t = time.time()
     user_features = compute_user_features(reviews_df)
     user_features.write.parquet(f"{args.output}/user_features", mode="overwrite")
-    print(f"  Users: {user_features.count():,}")
+    n_users = user_features.count()
+    _log_metric("unique_users", n_users)
+    _log_metric("user_features_elapsed_s", round(time.time() - t, 2), "s")
+    print(f"  Users: {n_users:,}")
 
     print("Computing item features...")
+    t = time.time()
     item_features = compute_item_features(reviews_df, metadata_df)
     item_features.write.parquet(f"{args.output}/item_features", mode="overwrite")
-    print(f"  Items: {item_features.count():,}")
+    n_items = item_features.count()
+    _log_metric("unique_items", n_items)
+    _log_metric("item_features_elapsed_s", round(time.time() - t, 2), "s")
+    print(f"  Items: {n_items:,}")
 
     print("Computing interactions...")
+    t = time.time()
     interactions = compute_interactions(reviews_df)
     interactions.write.parquet(f"{args.output}/interactions", mode="overwrite")
-    print(f"  Interactions: {interactions.count():,}")
+    n_interactions = interactions.count()
+    _log_metric("total_interactions", n_interactions)
+    _log_metric("interactions_elapsed_s", round(time.time() - t, 2), "s")
+    print(f"  Interactions: {n_interactions:,}")
+
+    job_elapsed = time.time() - job_start
+    throughput = int(total_reviews / job_elapsed) if job_elapsed > 0 else 0
+    _log_metric("total_elapsed_s", round(job_elapsed, 2), "s")
+    _log_metric("throughput_rows_per_s", throughput, "rows/s")
+
+    print(
+        f"\n{'='*60}\n"
+        f"Feature engineering complete.\n"
+        f"  Mode     : {'GPU (RAPIDS)' if gpu_mode else 'CPU'}\n"
+        f"  Reviews  : {total_reviews:,}\n"
+        f"  Users    : {n_users:,}  |  Items: {n_items:,}\n"
+        f"  Elapsed  : {job_elapsed:.1f}s\n"
+        f"  Throughput: {throughput:,} rows/s\n"
+        f"{'='*60}"
+    )
 
     spark.stop()
-    print("Feature engineering complete.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,68 @@
+---
+# CPU Baseline Feature Engineering — A/B comparison target for RAPIDS GPU demo.
+#
+# PURPOSE (Summit demo)
+#   Run this BEFORE spark-application-rapids.yaml to establish the CPU baseline.
+#   Compare [METRIC] total_elapsed_s and throughput_rows_per_s in the driver logs
+#   to show GPU speedup.
+#
+# IDENTICAL to spark-application-rapids.yaml except:
+#   - image: spark-jobs (no RAPIDS JAR, no GPU plugin)
+#   - no sparkConf GPU/RAPIDS keys
+#   - no executor.gpu block
+#   - name suffix: -cpu-baseline (safe to run alongside RAPIDS job)
+#
+# WHAT TO CAPTURE FOR THE DEMO:
+#   After the job completes, grep the driver pod logs:
+#     oc logs -n smartshop <driver-pod> | grep METRIC
+#   Key numbers:
+#     [METRIC] total_elapsed_s=<N> s           ← CPU wall-clock time
+#     [METRIC] throughput_rows_per_s=<N> rows/s ← CPU throughput
+#   Then repeat with RAPIDS and compute speedup = CPU_elapsed / GPU_elapsed.
+#
+# USAGE:
+#   /bin/bash -c 'set -a; source .env; set +a; envsubst < infrastructure/openshift/spark-application-cpu-baseline.yaml | oc apply -f -'
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: smartshop-feature-engineering-cpu-baseline
+  namespace: ${NAMESPACE}
+spec:
+  type: Python
+  pythonVersion: "3"
+  mode: cluster
+  image: "${SPARK_JOBS_IMAGE}"
+  imagePullPolicy: Always
+  mainApplicationFile: "local:///opt/spark/work-dir/feature_engineering.py"
+  arguments:
+    - "--input"
+    - "s3a://${S3_RAW_BUCKET}/raw/reviews/"
+    - "--output"
+    - "s3a://${S3_FEATURES_BUCKET}/cpu-baseline/"
+    - "--metadata-input"
+    - "s3a://${S3_RAW_BUCKET}/raw/metadata/"
+  sparkVersion: "3.5.3"
+  restartPolicy:
+    type: Never
+  hadoopConf:
+    fs.s3a.endpoint: "http://minio.${NAMESPACE}.svc.cluster.local:9000"
+    fs.s3a.path.style.access: "true"
+    fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    fs.s3a.aws.credentials.provider: "org.apache.hadoop.fs.s3a.EnvironmentVariableCredentialsProvider"
+  sparkConf:
+    spark.sql.adaptive.enabled: "true"
+    spark.sql.shuffle.partitions: "200"
+  driver:
+    cores: ${SPARK_DRIVER_CORES:-2}
+    memory: "${SPARK_DRIVER_MEMORY:-4g}"
+    serviceAccount: spark
+    envFrom:
+      - secretRef:
+          name: smartshop-credentials
+  executor:
+    cores: ${SPARK_EXECUTOR_CORES:-4}
+    instances: ${SPARK_EXECUTOR_INSTANCES:-4}
+    memory: "${SPARK_EXECUTOR_MEMORY:-8g}"
+    envFrom:
+      - secretRef:
+          name: smartshop-credentials
