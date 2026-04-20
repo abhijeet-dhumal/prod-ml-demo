@@ -32,7 +32,7 @@ metadata:
   name: feast-registry-postgres-secret
   namespace: smartshop
 stringData:
-  registry: |
+  sql: |
     registry_type: sql
     path: postgresql+psycopg2://${PG_USER}:${PG_PASSWORD}@${PG_CLUSTERIP}:5432/${PG_DATABASE}
     cache_mode: thread
@@ -47,7 +47,7 @@ metadata:
   name: feast-spark-config
   namespace: smartshop
 stringData:
-  offline_store: |
+  spark: |
     type: spark
     spark_master: k8s://https://kubernetes.default.svc:443
     spark_app_name: feast-materialize
@@ -93,21 +93,16 @@ spec:
       featureRepoPath: feast/feature_repo
 
   services:
-    # ---- Offline store (Spark) ----
-    # SparkOfflineStore distributes materialization across Spark executor pods.
-    # Required for 571M-row Amazon Reviews dataset — dask would OOM a single pod.
-    # Spark config injected from feast-spark-config secret.
-    #
-    # Image override: feastdev/feature-server doesn't ship pyspark.
-    # We use our custom spark-jobs image which has pyspark + feast + hadoop-aws JAR.
+    # ---- Offline store (dask) ----
+    # dask reads Parquet from MinIO S3 in-memory — no dedicated PVC needed.
+    # For demo/sample dataset (~1M reviews) this is sufficient.
+    # Production path: SparkOfflineStore + SparkSource requires a custom Feast server
+    # image that ships pyspark; feastdev/feature-server does not include it.
     offlineStore:
       persistence:
-        store:
-          type: spark
-          secretRef:
-            name: feast-spark-config
+        file:
+          type: dask
       server:
-        image: ${SPARK_JOBS_IMAGE}
         envFrom:
           - secretRef:
               name: feast-s3-credentials
@@ -124,17 +119,25 @@ spec:
           - secretRef:
               name: feast-s3-credentials
 
-    # ---- Registry (SQL / PostgreSQL) ----
-    # SQL registry is required for concurrent writes (Spark materialization
-    # runs multiple workers writing to the registry simultaneously).
-    # File-based registry.db is incompatible with multi-replica/concurrent-write scenarios.
+    # ---- Registry (file / NFS PVC) ----
+    # Note: SQL registry (type: sql + psycopg2) and SparkOfflineStore (pyspark) both require
+    # packages not present in the RHOAI image (odh-feature-server-rhel9). The feast-registry-
+    # postgres-secret and feast-spark-config secrets exist for when a custom image is used.
+    # For now: file registry on a dedicated 1Gi NFS PVC (separate from smartshop-shared-storage
+    # to avoid NFS CSI double-mount in the same pod).
     registry:
       local:
         persistence:
-          store:
-            type: sql
-            secretRef:
-              name: feast-registry-postgres-secret
+          file:
+            path: registry.db
+            pvc:
+              create:
+                accessModes: [ReadWriteOnce]
+                storageClassName: nfs-csi
+                resources:
+                  requests:
+                    storage: 1Gi
+              mountPath: /feast-registry
         server:
           restAPI: true
           envFrom:

@@ -1,11 +1,10 @@
 # Local development config.
-# In-cluster, the Feast operator CR (feast-operator.yaml) overrides these backends entirely.
+# In-cluster, the Feast operator CR (feast-operator.yaml) overrides these backends.
 #
 # For local `feast apply` / `feast materialize` against the dev cluster:
-#   export SPARK_MASTER=k8s://https://<cluster-api-url>:6443   (or local[*] for local Spark)
-#   export MINIO_ACCESS_KEY=<key>
-#   export MINIO_SECRET_KEY=<secret>
-#   export MINIO_ENDPOINT=https://minio-s3-smartshop.apps.<cluster-domain>
+#   export AWS_ENDPOINT_URL_S3=https://minio-s3-smartshop.apps.<cluster-domain>
+#   export AWS_ACCESS_KEY_ID=<key>
+#   export AWS_SECRET_ACCESS_KEY=<secret>
 #   export REDIS_HOST=<port-forward-host>
 #   export REDIS_PORT=6379
 #   export REDIS_PASSWORD=<password>
@@ -20,19 +19,9 @@ registry:
   cache_mode: thread
   cache_ttl_seconds: 60
 
-# SparkOfflineStore — matches in-cluster FeatureStore CR.
-# For local[*] (single-machine) testing, set SPARK_MASTER=local[*].
+# dask offline store (file-based) — matches in-cluster FeatureStore CR.
 offline_store:
-  type: spark
-  spark_master: "${SPARK_MASTER:-local[*]}"
-  spark_app_name: feast-local
-  spark_conf:
-    spark.hadoop.fs.s3a.endpoint: "${MINIO_ENDPOINT:-http://localhost:9000}"
-    spark.hadoop.fs.s3a.access.key: "${MINIO_ACCESS_KEY}"
-    spark.hadoop.fs.s3a.secret.key: "${MINIO_SECRET_KEY}"
-    spark.hadoop.fs.s3a.path.style.access: "true"
-    spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
-    spark.hadoop.fs.s3a.aws.credentials.provider: "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+  type: file
 
 online_store:
   type: redis
