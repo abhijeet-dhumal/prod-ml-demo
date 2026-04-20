@@ -73,6 +73,17 @@ spec:
     # Adaptive query execution for GPU execution
     spark.sql.files.maxPartitionBytes: "512m"
     spark.sql.adaptive.enabled: "true"
+    # ── Observability ──────────────────────────────────────────────────────────
+    # Log which DataFrame ops ran on GPU vs fell back to CPU (driver stdout)
+    spark.rapids.sql.explain: "ALL"
+    # Per-task GPU time in Spark UI Task tab + MLflow (gpuTimeNs, etc.)
+    spark.rapids.sql.metrics.level: "DEBUG"
+    # Built-in Prometheus endpoint on driver/executor :4040/metrics/prometheus
+    spark.ui.prometheus.enabled: "true"
+    # Capture per-executor CPU process tree (rss, vmem) for memory comparison
+    spark.executor.processTreeMetrics.enabled: "true"
+    # Metrics config file (mounted from spark-metrics-config ConfigMap)
+    spark.metrics.conf: "/etc/spark-metrics/metrics.properties"
   driver:
     cores: ${SPARK_DRIVER_CORES:-2}
     memory: "${SPARK_DRIVER_MEMORY:-4g}"
@@ -80,6 +91,9 @@ spec:
     envFrom:
       - secretRef:
           name: smartshop-credentials
+    volumeMounts:
+      - name: spark-metrics-config
+        mountPath: /etc/spark-metrics
   executor:
     cores: ${SPARK_EXECUTOR_CORES:-4}
     # 4 executors (1 GPU each) — safe default for both sample and full dataset.
@@ -93,3 +107,10 @@ spec:
     envFrom:
       - secretRef:
           name: smartshop-credentials
+    volumeMounts:
+      - name: spark-metrics-config
+        mountPath: /etc/spark-metrics
+  volumes:
+    - name: spark-metrics-config
+      configMap:
+        name: spark-metrics-config

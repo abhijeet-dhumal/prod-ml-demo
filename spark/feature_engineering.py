@@ -20,6 +20,11 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
+try:
+    from utils.mlflow_metrics import SparkRunLogger
+except ImportError:
+    SparkRunLogger = None  # graceful fallback when running outside the image
+
 
 def _log_metric(label: str, value, unit: str = "") -> None:
     """Emit a structured metric line for easy grep in pod logs and Spark history."""
@@ -133,9 +138,21 @@ def main():
     spark = create_spark_session()
 
     gpu_mode = _rapids_active(spark)
+    run_name = f"{'rapids' if gpu_mode else 'cpu'}-{spark.conf.get('spark.executor.instances', '?')}ex"
+    mlflow_logger = SparkRunLogger(spark, experiment="smartshop-feature-engineering") if SparkRunLogger else None
+
     _log_metric("gpu_accelerated", gpu_mode)
     _log_metric("spark_app_name", spark.sparkContext.appName)
     print(f"GPU/RAPIDS acceleration: {'ON' if gpu_mode else 'OFF (CPU mode)'}")
+
+    _run_ctx = mlflow_logger.start_run(run_name=run_name) if mlflow_logger else None
+    if _run_ctx:
+        _run_ctx.__enter__()
+
+    def _metric(key: str, value, unit: str = "") -> None:
+        _log_metric(key, value, unit)
+        if mlflow_logger:
+            mlflow_logger.log_metric(key, value)
 
     print(f"Reading reviews from {args.input}")
     read_start = time.time()
@@ -165,8 +182,8 @@ def main():
     total_reviews = reviews_df.count()
     read_elapsed = time.time() - read_start
     print(f"Total reviews: {total_reviews:,}")
-    _log_metric("total_reviews", total_reviews)
-    _log_metric("read_elapsed_s", round(read_elapsed, 2), "s")
+    _metric("total_reviews", total_reviews)
+    _metric("read_elapsed_s", round(read_elapsed, 2), "s")
 
     # Load metadata if provided
     metadata_df = None
@@ -180,8 +197,8 @@ def main():
     user_features = compute_user_features(reviews_df)
     user_features.write.parquet(f"{args.output}/user_features", mode="overwrite")
     n_users = user_features.count()
-    _log_metric("unique_users", n_users)
-    _log_metric("user_features_elapsed_s", round(time.time() - t, 2), "s")
+    _metric("unique_users", n_users)
+    _metric("user_features_elapsed_s", round(time.time() - t, 2), "s")
     print(f"  Users: {n_users:,}")
 
     print("Computing item features...")
@@ -189,8 +206,8 @@ def main():
     item_features = compute_item_features(reviews_df, metadata_df)
     item_features.write.parquet(f"{args.output}/item_features", mode="overwrite")
     n_items = item_features.count()
-    _log_metric("unique_items", n_items)
-    _log_metric("item_features_elapsed_s", round(time.time() - t, 2), "s")
+    _metric("unique_items", n_items)
+    _metric("item_features_elapsed_s", round(time.time() - t, 2), "s")
     print(f"  Items: {n_items:,}")
 
     print("Computing interactions...")
@@ -198,14 +215,20 @@ def main():
     interactions = compute_interactions(reviews_df)
     interactions.write.parquet(f"{args.output}/interactions", mode="overwrite")
     n_interactions = interactions.count()
-    _log_metric("total_interactions", n_interactions)
-    _log_metric("interactions_elapsed_s", round(time.time() - t, 2), "s")
+    _metric("total_interactions", n_interactions)
+    _metric("interactions_elapsed_s", round(time.time() - t, 2), "s")
     print(f"  Interactions: {n_interactions:,}")
 
     job_elapsed = time.time() - job_start
     throughput = int(total_reviews / job_elapsed) if job_elapsed > 0 else 0
-    _log_metric("total_elapsed_s", round(job_elapsed, 2), "s")
-    _log_metric("throughput_rows_per_s", throughput, "rows/s")
+    _metric("total_elapsed_s", round(job_elapsed, 2), "s")
+    _metric("throughput_rows_per_s", throughput, "rows/s")
+
+    if mlflow_logger:
+        mlflow_logger.log_rapids_coverage()
+        mlflow_logger.finalize(output_path="/tmp/feature_engineering_metrics.json")
+    if _run_ctx:
+        _run_ctx.__exit__(None, None, None)
 
     print(
         f"\n{'='*60}\n"

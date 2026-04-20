@@ -52,6 +52,10 @@ spec:
   sparkConf:
     spark.sql.adaptive.enabled: "true"
     spark.sql.shuffle.partitions: "200"
+    # Observability — same config as RAPIDS job for apples-to-apples comparison
+    spark.ui.prometheus.enabled: "true"
+    spark.executor.processTreeMetrics.enabled: "true"
+    spark.metrics.conf: "/etc/spark-metrics/metrics.properties"
   driver:
     cores: ${SPARK_DRIVER_CORES:-2}
     memory: "${SPARK_DRIVER_MEMORY:-4g}"
@@ -59,6 +63,9 @@ spec:
     envFrom:
       - secretRef:
           name: smartshop-credentials
+    volumeMounts:
+      - name: spark-metrics-config
+        mountPath: /etc/spark-metrics
   executor:
     cores: ${SPARK_EXECUTOR_CORES:-4}
     instances: ${SPARK_EXECUTOR_INSTANCES:-4}
@@ -66,3 +73,10 @@ spec:
     envFrom:
       - secretRef:
           name: smartshop-credentials
+    volumeMounts:
+      - name: spark-metrics-config
+        mountPath: /etc/spark-metrics
+  volumes:
+    - name: spark-metrics-config
+      configMap:
+        name: spark-metrics-config
