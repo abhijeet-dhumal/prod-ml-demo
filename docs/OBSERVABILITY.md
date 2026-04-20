@@ -275,6 +275,109 @@ if len(bundles) >= 2:
 
 ---
 
+---
+
+## Layer 8 — Redis & Data Access (redis_exporter)
+
+RedisInsight is deployed and accessible at `redisinsight-smartshop.apps.<cluster>` for GUI
+inspection. For time-series Prometheus metrics, deploy `redis_exporter`:
+
+```bash
+# 1. Enable user-workload monitoring (once, cluster-admin)
+oc apply -f infrastructure/openshift/user-workload-monitoring.yaml
+
+# 2. Deploy redis_exporter
+source .env
+envsubst < infrastructure/openshift/redis-exporter.yaml | oc apply -f -
+
+# 3. Verify scraping
+oc port-forward -n smartshop svc/redis-exporter 9121:9121
+curl http://localhost:9121/metrics | grep redis_commands
+```
+
+**Key Feast-specific metrics to watch:**
+
+| Prometheus metric | Feast meaning |
+|---|---|
+| `redis_commands_processed_total` | Feature retrieval throughput (HGET/GET per request) |
+| `redis_keyspace_hits_total` | Cache hits — materialized features being served |
+| `redis_keyspace_misses_total` | Cache misses — features not yet materialized |
+| `redis_db_keys` | Total materialized feature keys in online store |
+| `redis_memory_used_bytes` | Memory footprint of online feature store |
+
+**PromQL for hit ratio:**
+```promql
+rate(redis_keyspace_hits_total{namespace="smartshop"}[5m]) /
+  (rate(redis_keyspace_hits_total{namespace="smartshop"}[5m]) +
+   rate(redis_keyspace_misses_total{namespace="smartshop"}[5m]))
+```
+Target: **> 95%** during inference (warm feature store).
+
+---
+
+## Layer 9 — Grafana Dashboards
+
+No Grafana Operator on this cluster, so a standalone Grafana deployment is provided.
+Three pre-wired dashboards load on startup:
+
+```bash
+source .env
+envsubst < infrastructure/openshift/grafana.yaml | oc apply -f -
+oc get route grafana -n smartshop
+# → https://grafana-smartshop.apps.<cluster>  (admin / smartshop2026)
+```
+
+| Dashboard | UID | What it shows |
+|---|---|---|
+| GPU Performance (RAPIDS vs CPU) | `smartshop-gpu` | DCGM util, FB mem, SM active, NVLink BW, power |
+| Redis Feature Store | `smartshop-redis` | ops/sec, hit ratio, memory, connected clients |
+| Spark Executor Metrics | `smartshop-spark` | JVM heap, GC, shuffle bytes, BlockManager cache |
+
+Grafana reads from **OCP Thanos** (port 9091, cluster-wide metrics) and
+**user-workload Prometheus** (port 9092, redis_exporter + Spark PrometheusServlet).
+Auth via the `grafana-sa` service account token (auto-mounted).
+
+---
+
+## Layer 10 — Analysis Notebook (publication-quality charts)
+
+`notebooks/metrics_analysis.ipynb` — pulls everything and generates charts ready for
+blog posts, summit slides, and upstream community sharing:
+
+```bash
+# Run from repo root (load .env automatically)
+cd /Users/abdhumal/Dev/RedHatDev/prod-ml-demo
+jupyter notebook notebooks/metrics_analysis.ipynb
+
+# Or in an RHOAI JupyterLab instance — all env vars will be set
+```
+
+**Charts generated:**
+1. `mlflow_gpu_vs_cpu.png` — wall-clock speedup + throughput comparison bar chart
+2. `dcgm_combined.png` — 6-panel DCGM GPU metrics over job window
+3. `redis_metrics.png` — ops/sec, hit ratio, memory during Feast materialization + inference
+4. `rapids_coverage.png` — GPU operator coverage pie + CPU vs RAPIDS stage comparison
+5. `mlflow_stage_breakdown.png` — per-stage timing (user/item features, interactions)
+
+All charts are bundled into `summit_charts.zip` and optionally uploaded to MinIO.
+
+---
+
+## OpenTelemetry — Honest Assessment
+
+| Scenario | Recommended approach |
+|---|---|
+| Redis access latency p99 | `redis_exporter` covers this via `LATENCY HISTORY`; no OTEL needed |
+| Data access timing (MinIO reads) | Boto3 timing wrappers in `download.py` + log to MLflow |
+| Spark stage latency | Spark REST API already captures this |
+| Full distributed trace (Gradio→KServe→Feast→Redis) | Requires OTEL Collector + Tempo — **next step post-Summit** |
+
+OTEL full tracing is the right long-term investment. For the Summit scope,
+`redis_exporter` + Prometheus covers all the Redis proof needed, and the notebook
+stitches it into publication-quality visualizations.
+
+---
+
 ## Files
 
 | File | Purpose |
@@ -285,4 +388,8 @@ if len(bundles) >= 2:
 | `infrastructure/openshift/spark-application-rapids.yaml` | RAPIDS SparkApp + observability conf |
 | `infrastructure/openshift/spark-application-cpu-baseline.yaml` | CPU baseline for A/B |
 | `infrastructure/openshift/metrics-collection-job.yaml` | On-cluster scraper Job |
-| `scripts/collect-run-metrics.sh` | Post-run bundle script (Spark REST + DCGM + MLflow + NCCL) |
+| `infrastructure/openshift/user-workload-monitoring.yaml` | Enable OCP user-workload Prometheus |
+| `infrastructure/openshift/redis-exporter.yaml` | redis_exporter + ServiceMonitor |
+| `infrastructure/openshift/grafana.yaml` | Grafana + 3 pre-wired dashboards |
+| `scripts/collect-run-metrics.sh` | Post-run bundle (Spark REST + DCGM + MLflow + NCCL) |
+| `notebooks/metrics_analysis.ipynb` | Analysis notebook — pull everything, generate charts |
