@@ -61,8 +61,8 @@ oc get route grafana -n smartshop -o jsonpath='{.spec.host}'
 | Status | # | Step | Command | Done when |
 |---|---|---|---|---|
 | 🔲 | 2.1 | Upload download script to ConfigMap | `oc create configmap smartshop-download-script --from-file=download_to_minio.py=<(python3 -c "import json; cm=open('infrastructure/openshift/data-download-job.yaml').read(); ...") -n smartshop` | See note below |
-| 🔲 | 2.2 | Submit data download Job | `source .env && envsubst < infrastructure/openshift/data-download-job.yaml \| oc apply -f -` | Job created |
-| 🔲 | 2.3 | Tail download logs | `oc logs -n smartshop -f job/smartshop-data-download` | Logs show `=== Download complete ===` |
+| ✅ | 2.2 | Submit data download Job | `source .env && envsubst < infrastructure/openshift/data-download-job.yaml \| oc apply -f -` | Job created — pod `smartshop-data-download-flv9g` Running on `oai-kft-ibm-jcsbk-gpu-2-8gmgw` |
+| 🔄 | 2.3 | Tail download logs | `oc logs -n smartshop -f job/smartshop-data-download` | Running — image pulling on GPU node (first run), will stream HF → MinIO |
 | 🔲 | 2.4 | Verify reviews in MinIO | `AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123 aws s3 ls s3://smartshop-raw/raw/reviews/ --endpoint-url https://minio-s3-smartshop.apps.oai-kft-ibm.ibm.rh-ods.com --no-verify-ssl` | 3 `.parquet` files (Electronics, Books, Home_and_Kitchen) |
 | 🔲 | 2.5 | Verify metadata in MinIO | Same but `raw/metadata/` | 3 `_meta.parquet` files |
 
@@ -278,3 +278,4 @@ python demo/app.py
 | Date | Update |
 |---|---|
 | 2026-04-08 | Phases 1–7 documented; cluster state: Feast Ready, Redis 0 keys, no data, no Spark jobs, no training, no serving |
+| 2026-04-08 | Phase 2 started — `smartshop-data-download` Job submitted, pod pulling image on `oai-kft-ibm-jcsbk-gpu-2-8gmgw`. Expected runtime: ~20 min for Electronics+Books+Home_and_Kitchen sample. Monitor: `oc logs -n smartshop -f job/smartshop-data-download` |
