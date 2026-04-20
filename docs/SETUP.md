@@ -886,23 +886,41 @@ REC_SERVER_IMAGE=quay.io/abdhumal/smartshop-rec-server:latest
 > See data download step below. Images are already built ✅.
 
 ```bash
-# Download dataset (49GB full, or ~2.5GB sample for dev)
-make data-full      # full: ~571M reviews
-# make data-sample  # 5% subset for local testing
-
-# Upload to MinIO
-source .env
-aws s3 sync data/raw/ s3://smartshop-raw/raw/ \
-  --endpoint-url $MINIO_ENDPOINT_EXTERNAL --no-verify-ssl
-
-# Submit Spark feature engineering + text preprocessing + embeddings
-envsubst < infrastructure/openshift/spark-application.yaml | oc apply -f -
+# Download dataset (~1M reviews per category, streaming — no full file cache)
+python data/download.py --mode sample       # dev/demo: ~1M reviews, ~500MB
+# python data/download.py --mode full       # Summit full run: 49GB (run on cluster)
 ```
 
-Or for the GPU-accelerated path (requires RAPIDS-capable GPU nodes):
+Upload reviews and metadata to separate prefixes (the Spark jobs expect this layout):
 
 ```bash
-envsubst < infrastructure/openshift/spark-application-rapids.yaml | oc apply -f -
+source .env
+S3=https://$(oc get route minio-s3 -n smartshop -o jsonpath='{.spec.host}')
+
+# Reviews → raw/reviews/  |  Metadata → raw/metadata/
+for f in data/sample/*.parquet; do
+  name=$(basename "$f")
+  if [[ "$name" == *_meta.parquet ]]; then
+    AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" \
+      aws s3 cp "$f" s3://smartshop-raw/raw/metadata/"$name" --endpoint-url $S3 --no-verify-ssl
+  else
+    AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" \
+      aws s3 cp "$f" s3://smartshop-raw/raw/reviews/"$name" --endpoint-url $S3 --no-verify-ssl
+  fi
+done
+```
+
+**GPU path (A100s, recommended):** Uses RAPIDS-accelerated Spark — `groupBy/agg/join` run on GPU. 8 executors × 1 A100 each across 2 nodes:
+
+```bash
+# feature engineering (RAPIDS GPU)
+/bin/bash -c 'set -a; source .env; set +a; envsubst < infrastructure/openshift/spark-application-rapids.yaml | oc apply -f -'
+```
+
+**CPU path (fallback):** All three jobs — feature engineering + text preprocessing + embeddings:
+
+```bash
+/bin/bash -c 'set -a; source .env; set +a; envsubst < infrastructure/openshift/spark-application.yaml | oc apply -f -'
 ```
 
 **Monitor:**

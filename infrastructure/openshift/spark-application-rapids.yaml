@@ -17,7 +17,7 @@ spec:
   mainApplicationFile: "local:///opt/spark/work-dir/feature_engineering.py"
   arguments:
     - "--input"
-    - "s3a://${S3_RAW_BUCKET}/raw/"
+    - "s3a://${S3_RAW_BUCKET}/raw/reviews/"
     - "--output"
     - "s3a://${S3_FEATURES_BUCKET}/"
     - "--metadata-input"
@@ -59,7 +59,9 @@ spec:
           name: smartshop-credentials
   executor:
     cores: ${SPARK_EXECUTOR_CORES:-4}
-    instances: ${SPARK_EXECUTOR_INSTANCES:-4}
+    # Use 8 executors (1 GPU each) across both A100 nodes — 4 per node × 2 nodes.
+    # Reduce to 4 for sample data (1M reviews). Bump to 16 for full 571M dataset.
+    instances: ${SPARK_EXECUTOR_INSTANCES:-8}
     memory: "${SPARK_EXECUTOR_MEMORY:-8g}"
     gpu:
       name: "nvidia.com/gpu"

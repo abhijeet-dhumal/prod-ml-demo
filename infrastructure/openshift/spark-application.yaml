@@ -16,7 +16,7 @@ spec:
   mainApplicationFile: "local:///opt/spark/work-dir/feature_engineering.py"
   arguments:
     - "--input"
-    - "s3a://${S3_RAW_BUCKET}/raw/"
+    - "s3a://${S3_RAW_BUCKET}/raw/reviews/"
     - "--output"
     - "s3a://${S3_FEATURES_BUCKET}/"
     - "--metadata-input"
@@ -62,7 +62,7 @@ spec:
   mainApplicationFile: "local:///opt/spark/work-dir/text_preprocessing.py"
   arguments:
     - "--input"
-    - "s3a://${S3_RAW_BUCKET}/raw/"
+    - "s3a://${S3_RAW_BUCKET}/raw/reviews/"
     - "--output"
     - "s3a://${S3_FEATURES_BUCKET}/llm_data/"
   sparkVersion: "3.5.3"
@@ -105,7 +105,7 @@ spec:
   mainApplicationFile: "local:///opt/spark/work-dir/embedding_generation.py"
   arguments:
     - "--input"
-    - "s3a://${S3_RAW_BUCKET}/raw/"
+    - "s3a://${S3_RAW_BUCKET}/raw/reviews/"
     - "--output"
     - "s3a://${S3_EMBEDDINGS_BUCKET}/review_embeddings/"
     - "--model"
