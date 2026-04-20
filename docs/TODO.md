@@ -34,11 +34,11 @@
 
 | Status | # | Step | Command | Done when |
 |---|---|---|---|---|
-| 🔲 | 1.1 | Enable user-workload monitoring (cluster-admin, once) | `oc apply -f infrastructure/openshift/user-workload-monitoring.yaml` | `oc get prometheus -n openshift-user-workload-monitoring` shows a pod |
-| 🔲 | 1.2 | Apply Spark metrics ConfigMap | `source .env && envsubst < infrastructure/openshift/spark-metrics-configmap.yaml \| oc apply -f -` | `oc get cm spark-metrics-config -n smartshop` |
-| 🔲 | 1.3 | Deploy `redis_exporter` + ServiceMonitor | `source .env && envsubst < infrastructure/openshift/redis-exporter.yaml \| oc apply -f -` | `oc get pod -n smartshop -l app=redis-exporter` Running |
-| 🔲 | 1.4 | Deploy Grafana | `source .env && envsubst < infrastructure/openshift/grafana.yaml \| oc apply -f -` | `oc get route grafana -n smartshop` has a host |
-| 🔲 | 1.5 | Get Prometheus token → `.env` | `oc sa get-token grafana-sa -n smartshop` → add to `PROMETHEUS_TOKEN=` in `.env` | Grafana dashboards load data |
+| ✅ | 1.1 | Enable user-workload monitoring (cluster-admin, once) | `oc apply -f infrastructure/openshift/user-workload-monitoring.yaml` | `cluster-monitoring-config` ConfigMap created |
+| ✅ | 1.2 | Apply Spark metrics ConfigMap | `envsubst < infrastructure/openshift/spark-metrics-configmap.yaml \| oc apply -f -` | `spark-metrics-config` CM created in smartshop |
+| ✅ | 1.3 | Deploy `redis_exporter` + ServiceMonitor | `envsubst < infrastructure/openshift/redis-exporter.yaml \| oc apply -f -` | Pod `redis-exporter-6c58cd8fbf-zlfkp` Running, 25 metrics exposed |
+| ✅ | 1.4 | Deploy Grafana | `envsubst < infrastructure/openshift/grafana.yaml \| oc apply -f -` | Pod `grafana-7c755b8f6f-4fkj9` Running — https://grafana-smartshop.apps.oai-kft-ibm.ibm.rh-ods.com |
+| ✅ | 1.5 | Get Prometheus token → `.env` | `oc create token grafana-sa -n smartshop --duration=8760h` | Token saved to `PROMETHEUS_TOKEN` in `.env` |
 | 🔲 | 1.6 | Verify Grafana loads GPU metrics | Open `https://grafana-smartshop.apps.oai-kft-ibm.ibm.rh-ods.com` → GPU dashboard | DCGM panels show data |
 
 **Verification:**
@@ -61,10 +61,10 @@ oc get route grafana -n smartshop -o jsonpath='{.spec.host}'
 | Status | # | Step | Command | Done when |
 |---|---|---|---|---|
 | 🔲 | 2.1 | Upload download script to ConfigMap | `oc create configmap smartshop-download-script --from-file=download_to_minio.py=<(python3 -c "import json; cm=open('infrastructure/openshift/data-download-job.yaml').read(); ...") -n smartshop` | See note below |
-| ✅ | 2.2 | Submit data download Job | `source .env && envsubst < infrastructure/openshift/data-download-job.yaml \| oc apply -f -` | Job created — pod `smartshop-data-download-flv9g` Running on `oai-kft-ibm-jcsbk-gpu-2-8gmgw` |
-| 🔄 | 2.3 | Tail download logs | `oc logs -n smartshop -f job/smartshop-data-download` | Running — image pulling on GPU node (first run), will stream HF → MinIO |
-| 🔲 | 2.4 | Verify reviews in MinIO | `AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123 aws s3 ls s3://smartshop-raw/raw/reviews/ --endpoint-url https://minio-s3-smartshop.apps.oai-kft-ibm.ibm.rh-ods.com --no-verify-ssl` | 3 `.parquet` files (Electronics, Books, Home_and_Kitchen) |
-| 🔲 | 2.5 | Verify metadata in MinIO | Same but `raw/metadata/` | 3 `_meta.parquet` files |
+| ✅ | 2.2 | Submit data download Job | Fixed script (no `datasets` lib needed), resubmitted | Job `smartshop-data-download` completed successfully |
+| ✅ | 2.3 | Tail download logs | `oc logs -n smartshop job/smartshop-data-download` | `=== Download complete ===` — 333K reviews/category streamed at ~40K rows/s |
+| ✅ | 2.4 | Verify reviews in MinIO | `aws s3 ls s3://smartshop-raw/raw/reviews/` | `Books.parquet` (125MB), `Electronics.parquet` (81MB), `Home_and_Kitchen.parquet` (76MB) |
+| ⚠️ | 2.5 | Verify metadata in MinIO | `aws s3 ls s3://smartshop-raw/raw/metadata/` | Only `Electronics_meta.parquet` (66MB) — Books and Home_and_Kitchen have no metadata shards in HF repo |
 
 > **Note on 2.1:** The download script is embedded in the ConfigMap inside `data-download-job.yaml`.
 > The easiest apply path is:
@@ -278,4 +278,6 @@ python demo/app.py
 | Date | Update |
 |---|---|
 | 2026-04-08 | Phases 1–7 documented; cluster state: Feast Ready, Redis 0 keys, no data, no Spark jobs, no training, no serving |
-| 2026-04-08 | Phase 2 started — `smartshop-data-download` Job submitted, pod pulling image on `oai-kft-ibm-jcsbk-gpu-2-8gmgw`. Expected runtime: ~20 min for Electronics+Books+Home_and_Kitchen sample. Monitor: `oc logs -n smartshop -f job/smartshop-data-download` |
+| 2026-04-20 | Phase 1 complete ✅ — user-workload monitoring, spark-metrics-config, redis_exporter, Grafana all deployed. PROMETHEUS_TOKEN saved. |
+| 2026-04-20 | Phase 2 complete ✅ (partial) — 1M reviews across 3 categories in MinIO. Only Electronics has metadata. Books/Home_and_Kitchen metadata missing from HF repo. Spark jobs will use metadata only for Electronics. |
+| 2026-04-20 | Issues found: (1) `datasets` lib missing from spark-jobs image — fixed by using `requests` streaming instead. (2) `smartshop-credentials` secret had empty MINIO/AWS creds — patched directly with `oc patch`. Tracked in IMPROVEMENTS.md. |

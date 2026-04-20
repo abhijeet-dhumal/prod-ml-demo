@@ -22,6 +22,14 @@ Kubernetes Job streams HuggingFace Hub → MinIO via `s3fs`. Works but is hand-r
 | Local disk exhaustion for large datasets | 49 GB total dataset cannot be downloaded on a laptop | Enforce cluster-side ingestion as the default path; document this clearly |
 | No data versioning | Re-running the download job overwrites existing data silently | Integrate **DVC** or **Pachyderm** for dataset versioning, or use MinIO object versioning |
 
+### Issues found during execution (2026-04-20)
+
+| Issue | Root cause | Fix applied |
+|---|---|---|
+| Download Job failed: `ModuleNotFoundError: No module named 'datasets'` | `datasets` library not in `spark.txt`; spark-jobs image doesn't include it | Rewrote download script to use `requests` streaming + `huggingface_hub` only — no `datasets` needed |
+| `PermissionError: The Access Key Id you provided does not exist` | `smartshop-credentials` secret had empty `AWS_ACCESS_KEY_ID` / `MINIO_ACCESS_KEY` — `envsubst` ran when vars were unset | Patched secret directly: `oc patch secret smartshop-credentials -n smartshop --type=json` |
+| Books and Home_and_Kitchen have no metadata shards in HF repo | `raw_meta_Books/` directory does not exist in the dataset repo | Spark feature engineering will use metadata only for Electronics; join is `left` so other categories still produce features |
+
 ### Recommended platform addition
 > **RHOAI Data Sources panel** (similar to Model Registry but for datasets) that tracks
 > dataset URI, size, download date, schema, and links to the pipeline that consumed it.
@@ -174,7 +182,7 @@ and published in the RHOAI catalog** for production use:
 
 | Image | Base | What it needs | Current status |
 |---|---|---|---|
-| `spark-jobs` | UBI9 Python 3.11 | PySpark 3.5, PyArrow, s3fs, datasets, sentence-transformers, boto3 | ❌ Hand-built (`Containerfile.spark-jobs`) |
+| `spark-jobs` | UBI9 Python 3.11 | PySpark 3.5, PyArrow, s3fs, **datasets**, sentence-transformers, boto3 | ❌ Hand-built — `datasets` lib missing, caused download job failure on 2026-04-20 |
 | `spark-jobs-rapids` | apache/spark:3.5.3 | + `rapids-4-spark` JAR, `getGpusResources.sh` | ❌ Hand-built (`Containerfile.spark-rapids`) |
 | `rec-trainer` | UBI9 Python 3.11 | PyTorch 2.x, mlflow, feast, boto3, torchmetrics | ❌ Hand-built |
 | `llm-trainer` | UBI9 Python 3.11 | PyTorch 2.x + FSDP, peft, trl, mlflow, HuggingFace | ❌ Hand-built |

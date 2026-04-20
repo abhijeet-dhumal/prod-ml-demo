@@ -83,43 +83,49 @@ data:
   download_to_minio.py: |
     """Stream Amazon Reviews 2023 from HuggingFace directly to MinIO.
 
+    Uses only packages available in the spark-jobs image:
+      huggingface_hub, requests, pandas, pyarrow, s3fs
+    Does NOT require the `datasets` library.
+
     Reads env vars:
       DATA_DOWNLOAD_MODE  sample | full
       CATEGORIES          comma-separated list
       SAMPLE_PER_CATEGORY rows per category (sample mode)
       META_SAMPLE         metadata rows per category (sample mode)
-      HF_TOKEN            HuggingFace read token (from hf-credentials secret)
-      AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / MINIO_ENDPOINT (from smartshop-credentials)
+      token               HuggingFace read token (from hf-credentials secret)
+      AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / MINIO_ENDPOINT
 
     Dataset layout (McAuley-Lab/Amazon-Reviews-2023):
-      raw/review_categories/{Category}.jsonl       <- reviews (streamed line-by-line)
-      raw_meta_{Category}/full-*.parquet           <- metadata (Parquet shards)
+      raw/review_categories/{Category}.jsonl  <- reviews (line-delimited JSON)
+      raw_meta_{Category}/full-*.parquet      <- metadata Parquet shards
     """
 
     import io, json, os, time
-    from pathlib import PurePosixPath
 
     import pandas as pd
     import pyarrow as pa
     import pyarrow.parquet as pq
+    import requests
     import s3fs
-    from datasets import load_dataset
     from huggingface_hub import hf_hub_download, list_repo_files
 
-    DATASET   = "McAuley-Lab/Amazon-Reviews-2023"
-    HF_TOKEN  = os.environ.get("HF_TOKEN") or os.environ.get("token")
-    MODE      = os.environ.get("DATA_DOWNLOAD_MODE", "sample")
+    DATASET    = "McAuley-Lab/Amazon-Reviews-2023"
+    HF_TOKEN   = os.environ.get("token") or os.environ.get("HF_TOKEN", "")
+    MODE       = os.environ.get("DATA_DOWNLOAD_MODE", "sample")
     CATEGORIES = os.environ.get("CATEGORIES", "Electronics,Books,Home_and_Kitchen").split(",")
-    SAMPLE_N  = int(os.environ.get("SAMPLE_PER_CATEGORY", 333334))
-    META_N    = int(os.environ.get("META_SAMPLE", 50000))
+    SAMPLE_N   = int(os.environ.get("SAMPLE_PER_CATEGORY", 333334))
+    META_N     = int(os.environ.get("META_SAMPLE", 50000))
 
-    MINIO_ENDPOINT = os.environ["MINIO_ENDPOINT"].replace("http://", "").replace("https://", "")
-    S3_BUCKET = "smartshop-raw"
+    MINIO_ENDPOINT = os.environ["MINIO_ENDPOINT"]
+    S3_BUCKET  = "smartshop-raw"
+
+    print(f"HF_TOKEN present: {bool(HF_TOKEN)}")
+    print(f"MINIO_ENDPOINT: {MINIO_ENDPOINT}")
 
     fs = s3fs.S3FileSystem(
         key=os.environ["AWS_ACCESS_KEY_ID"],
         secret=os.environ["AWS_SECRET_ACCESS_KEY"],
-        endpoint_url=f"http://{MINIO_ENDPOINT}",
+        endpoint_url=MINIO_ENDPOINT,
         use_ssl=False,
     )
 
@@ -129,51 +135,72 @@ data:
         buf = io.BytesIO()
         pq.write_table(table, buf)
         buf.seek(0)
-        with fs.open(s3_path, "wb") as f:
-            f.write(buf.read())
+        with fs.open(s3_path, "wb") as fh:
+            fh.write(buf.read())
+        print(f"  wrote {len(df):,} rows → s3://{s3_path}")
+
+
+    def hf_resolve_url(filename: str) -> str:
+        """Get the direct download URL for a file in the HF dataset repo."""
+        return (f"https://huggingface.co/datasets/{DATASET}/resolve/main/{filename}")
 
 
     def download_reviews(category: str) -> None:
         t0 = time.time()
-        hf_url = f"hf://datasets/{DATASET}/raw/review_categories/{category}.jsonl"
-        print(f"[{category}] streaming reviews ({MODE}) from {hf_url} ...")
+        filename = f"raw/review_categories/{category}.jsonl"
+        url = hf_resolve_url(filename)
+        print(f"[{category}] streaming reviews ({MODE}) → {url}")
+
+        headers = {}
+        if HF_TOKEN:
+            headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
         max_rows = SAMPLE_N if MODE == "sample" else None
-        ds = load_dataset("json", data_files={"full": hf_url}, split="full",
-                          streaming=True, token=HF_TOKEN)
         rows, total = [], 0
-        for row in ds:
-            rows.append(row)
-            total += 1
-            if max_rows and total >= max_rows:
-                break
-            if total % 50_000 == 0:
-                print(f"  [{category}] {total:,} rows streamed...")
+
+        with requests.get(url, headers=headers, stream=True, timeout=300) as resp:
+            resp.raise_for_status()
+            for raw_line in resp.iter_lines():
+                if not raw_line:
+                    continue
+                rows.append(json.loads(raw_line))
+                total += 1
+                if total % 50_000 == 0:
+                    print(f"  [{category}] {total:,} rows streamed...")
+                if max_rows and total >= max_rows:
+                    break
 
         df = pd.DataFrame(rows)
         dest = f"{S3_BUCKET}/raw/reviews/{category}.parquet"
         write_parquet_to_s3(df, dest)
         elapsed = time.time() - t0
-        print(f"  [{category}] {len(df):,} reviews → s3://{dest}  ({elapsed:.1f}s, {len(df)/elapsed:,.0f} rows/s)")
+        print(f"[{category}] reviews done: {len(df):,} rows in {elapsed:.1f}s ({len(df)/elapsed:,.0f} rows/s)")
 
 
     def download_metadata(category: str) -> None:
         t0 = time.time()
-        all_files = list(list_repo_files(DATASET, repo_type="dataset", token=HF_TOKEN))
+        print(f"[{category}] listing metadata shards...")
+        all_files = list(list_repo_files(DATASET, repo_type="dataset", token=HF_TOKEN or None))
         shards = sorted(f for f in all_files
                         if f.startswith(f"raw_meta_{category}/") and f.endswith(".parquet"))
         if not shards:
             print(f"  [{category}] no metadata shards found — skipping")
             return
 
+        print(f"  [{category}] found {len(shards)} shard(s)")
         frames, collected = [], 0
         for shard in shards:
             local = hf_hub_download(repo_id=DATASET, filename=shard,
-                                    repo_type="dataset", token=HF_TOKEN)
+                                    repo_type="dataset", token=HF_TOKEN or None)
             df = pd.read_parquet(local)
             if MODE == "sample":
-                df = df.head(max(0, META_N - collected))
+                remaining = META_N - collected
+                if remaining <= 0:
+                    break
+                df = df.head(remaining)
             frames.append(df)
             collected += len(df)
+            print(f"  [{category}] metadata shard {shard}: {len(df):,} rows")
             if MODE == "sample" and collected >= META_N:
                 break
 
@@ -181,11 +208,12 @@ data:
         dest = f"{S3_BUCKET}/raw/metadata/{category}_meta.parquet"
         write_parquet_to_s3(result, dest)
         elapsed = time.time() - t0
-        print(f"  [{category}] {len(result):,} metadata rows → s3://{dest}  ({elapsed:.1f}s)")
+        print(f"[{category}] metadata done: {len(result):,} rows in {elapsed:.1f}s")
 
 
     if __name__ == "__main__":
-        print(f"=== SmartShop Data Download | mode={MODE} | categories={CATEGORIES} ===")
+        print(f"=== SmartShop Data Download ===")
+        print(f"mode={MODE} | categories={CATEGORIES} | sample_n={SAMPLE_N}")
         for cat in CATEGORIES:
             download_reviews(cat)
             download_metadata(cat)
