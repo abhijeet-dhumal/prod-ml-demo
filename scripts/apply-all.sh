@@ -93,6 +93,28 @@ connection_string: \"${REDIS_HOST}:${REDIS_PORT},password=${REDIS_PASSWORD}\"" \
     -n "$NAMESPACE" --dry-run=client -o yaml | oc apply -f -
   ok "secret feast-s3-credentials"
 
+  # MLflow token secret (MLFLOW_TRACKING_TOKEN must be pre-generated from RHOAI SA)
+  # Generate: TOKEN=$(oc create token <sa> -n redhat-ods-applications --duration=8760h)
+  # Then set MLFLOW_TRACKING_TOKEN=<token> in .env
+  if [[ -n "${MLFLOW_TRACKING_TOKEN:-}" ]]; then
+    oc create secret generic smartshop-mlflow-token \
+      --from-literal=MLFLOW_TRACKING_URI="$MLFLOW_TRACKING_URI" \
+      --from-literal=MLFLOW_TRACKING_TOKEN="$MLFLOW_TRACKING_TOKEN" \
+      --from-literal=MLFLOW_TRACKING_INSECURE_TLS="${MLFLOW_TRACKING_INSECURE_TLS:-true}" \
+      --from-literal=MLFLOW_WORKSPACE="$NAMESPACE" \
+      -n "$NAMESPACE" --dry-run=client -o yaml | oc apply -f -
+    ok "secret smartshop-mlflow-token"
+  else
+    echo "  ⚠  MLFLOW_TRACKING_TOKEN not set — creating empty mlflow token secret (tracking disabled)"
+    oc create secret generic smartshop-mlflow-token \
+      --from-literal=MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-}" \
+      --from-literal=MLFLOW_TRACKING_TOKEN="" \
+      --from-literal=MLFLOW_TRACKING_INSECURE_TLS="true" \
+      --from-literal=MLFLOW_WORKSPACE="$NAMESPACE" \
+      -n "$NAMESPACE" --dry-run=client -o yaml | oc apply -f -
+    ok "secret smartshop-mlflow-token (no token — MLflow disabled)"
+  fi
+
   # Spark RBAC (ServiceAccount + Role + RoleBinding)
   oc create serviceaccount spark -n "$NAMESPACE" --dry-run=client -o yaml | oc apply -f -
   oc create role spark-role \
@@ -114,6 +136,20 @@ connection_string: \"${REDIS_HOST}:${REDIS_PORT},password=${REDIS_PASSWORD}\"" \
   # User-workload monitoring (cluster-admin required, once)
   apply "$REPO_ROOT/infrastructure/openshift/user-workload-monitoring.yaml" || \
     echo "  ⚠ user-workload-monitoring: needs cluster-admin — skip if already enabled"
+
+  # MinIO: create smartshop-spark-logs bucket + events/ prefix (idempotent)
+  MINIO_POD=$(oc get pod -n "$NAMESPACE" -l app=minio \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+  if [[ -n "$MINIO_POD" ]]; then
+    oc exec -n "$NAMESPACE" "$MINIO_POD" -- /bin/sh -c "
+      mc alias set local http://localhost:9000 \${MINIO_ROOT_USER} \${MINIO_ROOT_PASSWORD} >/dev/null 2>&1
+      mc mb local/smartshop-spark-logs 2>/dev/null || true
+      printf '' | mc pipe local/smartshop-spark-logs/events/.keep >/dev/null 2>&1 || true
+      echo 'spark-logs bucket ready'
+    " && ok "MinIO smartshop-spark-logs/events/ bucket ready"
+  else
+    echo "  ⚠  MinIO pod not found — create smartshop-spark-logs/events/ bucket manually"
+  fi
 }
 
 # ── Phase: images ─────────────────────────────────────────────────────────────
@@ -167,7 +203,15 @@ phase_observability() {
 phase_spark() {
   log "Phase: spark"
 
-  # Refresh script ConfigMaps
+  # Spark History Server (event log UI)
+  apply "$REPO_ROOT/infrastructure/openshift/spark-history-server.yaml"
+  ok "Spark History Server Deployment + Service + Route"
+
+  # Spark metrics ConfigMap (shared by all SparkApps)
+  apply "$REPO_ROOT/infrastructure/openshift/spark-metrics-configmap.yaml"
+  ok "spark-metrics-config ConfigMap"
+
+  # Refresh script ConfigMaps (always sync from repo — these are hot-reloaded by pods)
   oc create configmap smartshop-feature-engineering-script \
     --from-file=feature_engineering.py="$REPO_ROOT/spark/feature_engineering.py" \
     -n "$NAMESPACE" --dry-run=client -o yaml | oc apply -f -
@@ -182,6 +226,13 @@ phase_spark() {
     --from-file=embedding_generation.py="$REPO_ROOT/spark/embedding_generation.py" \
     -n "$NAMESPACE" --dry-run=client -o yaml | oc apply -f -
   ok "embedding_generation script ConfigMap"
+
+  # Fixed mlflow_metrics.py (Python 3.8 compat + MLflow auth guard)
+  # Mounted into RAPIDS/cpu-baseline driver/executor pods to override the baked-in version
+  oc create configmap spark-mlflow-metrics-script \
+    --from-file=mlflow_metrics.py="$REPO_ROOT/spark/utils/mlflow_metrics.py" \
+    -n "$NAMESPACE" --dry-run=client -o yaml | oc apply -f -
+  ok "spark-mlflow-metrics-script ConfigMap (mlflow_metrics.py)"
 
   # GPU discovery script
   oc create configmap smartshop-gpu-discovery-script \
@@ -219,7 +270,29 @@ echo "[{\"name\": \"gpu\", \"addresses\": [\"$(nvidia-smi --query-gpu=uuid --for
 phase_feast() {
   log "Phase: feast"
 
-  # Patch Redis secret with correct password (Feast operator sets it empty by default)
+  # Apply Feast Spark engine ConfigMap + Secret
+  apply "$REPO_ROOT/infrastructure/openshift/feast-spark-engine.yaml"
+  ok "feast-spark-engine ConfigMap + feast-spark-config Secret"
+
+  # Apply FeatureStore CR (Feast operator deploys the pod)
+  apply "$REPO_ROOT/infrastructure/openshift/feast-operator.yaml"
+  ok "FeatureStore CR applied — waiting for pod to be Ready..."
+
+  # Wait up to 5 min for the feast pod to be 4/4 Running
+  echo "  Waiting for feast pod (4/4 containers)..."
+  timeout 300 bash -c "
+    until oc get pod -n $NAMESPACE -l 'feast.dev/name=smartshop-feast' \
+        -o jsonpath='{.items[0].status.containerStatuses[*].ready}' 2>/dev/null | \
+        grep -q 'true true true true'; do
+      sleep 10
+    done
+  " || { echo "  ⚠  Feast pod not ready after 5 min — check: oc describe pod -n $NAMESPACE -l feast.dev/name=smartshop-feast"; return 1; }
+  ok "Feast pod ready"
+
+  FEAST_POD=$(oc get pod -n "$NAMESPACE" -l "feast.dev/name=smartshop-feast" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+  # Patch Redis secret with correct password (Feast operator may reset it)
   REDIS_CONN_B64=$(python3 -c "
 import base64
 s = 'type: redis\nconnection_string: \"${REDIS_HOST}:${REDIS_PORT},password=${REDIS_PASSWORD}\"'
@@ -230,28 +303,16 @@ print(base64.b64encode(s.encode()).decode())
     -p="[{\"op\":\"replace\",\"path\":\"/data/redis\",\"value\":\"$REDIS_CONN_B64\"}]"
   ok "feast-redis-secret patched with Redis password"
 
-  # Copy updated features.py and run feast apply
-  FEAST_POD=$(oc get pod -n "$NAMESPACE" -l "feast.dev/name=smartshop-feast" \
-    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-  if [[ -z "$FEAST_POD" ]]; then
-    echo "  ERROR: feast pod not found — is the FeatureStore CR applied?"
-    exit 1
-  fi
-
-  oc cp "$REPO_ROOT/feast/feature_repo/features.py" \
-    "$NAMESPACE/$FEAST_POD:/feast-data/smartshop/feast/feature_repo/features.py" \
-    -c online
-  ok "features.py synced to feast pod"
-
-  oc exec -n "$NAMESPACE" "$FEAST_POD" -c online -- \
-    feast -c /feast-data/smartshop/feast/feature_repo apply
+  # Run feast apply via the registry container (has feast CLI + pyspark + SparkSource)
+  oc exec -n "$NAMESPACE" "$FEAST_POD" -c registry -- \
+    feast -c /feast-data/smartshop/feature_repo apply
   ok "feast apply — feature views registered"
 
   echo ""
   echo "  ⚠  Run feast materialize AFTER Spark ETL jobs complete:"
   echo "  bash scripts/wait-and-materialize.sh"
-  echo "  OR manually: oc exec -n $NAMESPACE $FEAST_POD -c online -- \\"
-  echo "    feast -c /feast-data/smartshop/feast/feature_repo materialize-incremental \$(date -u +%Y-%m-%dT%H:%M:%S)"
+  echo "  OR manually: oc exec -n $NAMESPACE $FEAST_POD -c registry -- \\"
+  echo "    feast -c /feast-data/smartshop/feature_repo materialize-incremental \$(date -u +%Y-%m-%dT%H:%M:%S)"
 }
 
 # ── Phase: training ───────────────────────────────────────────────────────────

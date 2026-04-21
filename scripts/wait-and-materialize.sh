@@ -65,7 +65,7 @@ log "═════════════════════════
 # Exit early if any job failed
 for app in "${APPS[@]}"; do
   status=$(oc get sparkapplication "$app" -n "$NAMESPACE" \
-    -o jsonpath='{.status.appState.state}' 2>/dev/null)
+    -o jsonpath='{.status.applicationState.state}' 2>/dev/null)
   if [[ "$status" == "FAILED" ]]; then
     log "ERROR: $app FAILED — check logs before materializing."
     log "  oc logs -n $NAMESPACE ${app}-driver | tail -50"
@@ -86,8 +86,8 @@ fi
 log "Running feast materialize-incremental via $FEAST_POD ..."
 MATL_START=$(date +%s)
 
-oc exec -n "$NAMESPACE" "$FEAST_POD" -c online -- \
-  feast -c /feast-data/smartshop/feast/feature_repo materialize-incremental \
+oc exec -n "$NAMESPACE" "$FEAST_POD" -c registry -- \
+  feast -c /feast-data/smartshop/feature_repo materialize-incremental \
     "$(date -u +%Y-%m-%dT%H:%M:%S)" 2>&1 | tee /tmp/feast-materialize.log
 
 MATL_ELAPSED=$(( $(date +%s) - MATL_START ))
