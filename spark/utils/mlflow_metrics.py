@@ -23,7 +23,7 @@ import platform
 import socket
 import time
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Optional, Union
 
 try:
     import mlflow
@@ -133,7 +133,7 @@ class SparkRunLogger:
         except Exception:
             return False
 
-    def log_metric(self, key: str, value: float | int, step: int | None = None) -> None:
+    def log_metric(self, key: str, value: Union[float, int], step: Optional[int] = None) -> None:
         self._metrics[key] = value
         if self._enabled:
             mlflow.log_metric(key, value, step=step)
@@ -177,7 +177,7 @@ class SparkRunLogger:
             int(rows_written / elapsed_s) if elapsed_s > 0 else 0,
         )
 
-    def finalize(self, output_path: str | None = None) -> dict:
+    def finalize(self, output_path: Optional[str] = None) -> dict:
         """Write structured metrics JSON to MLflow artifacts and optionally to a local path.
 
         Returns the metrics dict for programmatic use.
