@@ -92,4 +92,7 @@ spec:
                 name: feast-s3-credentials
           restAPI: true
 
-    ui: {}
+    ui:
+      server:
+        # UI also reads feature_store.yaml — needs feast[spark] to parse offline_store.type: spark
+        image: ${FEAST_SERVER_IMAGE}
