@@ -29,26 +29,37 @@ Both jobs processed the full Amazon review dataset (Electronics + Books + Home &
 
 | Metric | CPU Baseline | RAPIDS GPU | Speedup |
 |--------|-------------|------------|---------|
-| Total rows processed | 140,772,341 | 140,772,341 ✅ | same |
-| Read time (s) | _pending_ | **1,091.4** ✅ | — |
-| User feature aggregation (s) | _pending_ | **1,912.7** ✅ | — |
-| Item feature aggregation (s) | _pending_ | **786.4** ✅ | — |
-| Interaction join/write (s) | _pending_ | **844.3** ✅ | — |
-| **Total elapsed (s)** | _pending_ | **4,667.7** ✅ | _pending CPU_ |
-| **Wall-clock (s)** | _pending_ | **4,755** ✅ | _pending CPU_ |
-| Throughput (rows/s) | _pending_ | **30,159** ✅ | — |
-| Unique users | _pending_ | 35,049,327 ✅ | |
-| Unique items | _pending_ | 9,790,339 ✅ | |
-| `gpu_accelerated` flag | `False` | `True` ✅ | |
+| Total rows processed | 140,772,341 ✅ | 140,772,341 ✅ | same |
+| Read time (s) | 1,546.6 | **1,091.4** | **1.42×** |
+| User feature aggregation (s) | 3,020.8 | **1,912.7** | **1.58×** |
+| Item feature aggregation (s) | 1,366.7 | **786.4** | **1.74×** |
+| Interaction join/write (s) | 1,088.2 | **844.3** | **1.29×** |
+| **Total elapsed (s)** | **7,029.1** | **4,667.7** | **1.51× overall** |
+| **Wall-clock (s)** | **7,057** | **4,755** | **1.48×** |
+| Throughput (rows/s) | 20,026 | **30,159** | **+51%** |
+| Unique users | 35,049,327 ✅ | 35,049,327 ✅ | same |
+| Unique items | 9,790,339 ✅ | 9,790,339 ✅ | same |
+| `gpu_accelerated` flag | `False` ✅ | `True` ✅ | |
 
-> **Note on elapsed time:** The ~4,667s (78 min) total is significantly higher than earlier smaller-dataset runs.
-> This is the full 49 GB dataset with 140M rows on an I/O-bound MinIO S3 path.
-> The bottleneck is network throughput to object storage, not GPU compute — confirmed by Grafana DCGM
-> showing < 2.5% SM Active Ratio and sustained ~80–100W power (vs 400W A100 TDP).
-> CPU baseline still running — speedup ratio to be updated once complete.
+> **Bottleneck analysis:** Both jobs are I/O-bound (MinIO S3 over NFS).
+> RAPIDS advantage is columnar in-memory processing via CUDF — no JVM serialization overhead.
+> SM Active Ratio < 2.5%, GPU power 80–100W (vs 400W TDP) throughout — GPU waiting on S3 reads.
+> On a compute-bound workload or with local NVMe storage the speedup would be significantly higher.
+> Antonin (IBM cluster team) flagged storage as the bottleneck — SSD nodes would improve both jobs.
 
 **RAPIDS job completed:** `2026-04-21T15:25:39Z`  
-**CPU job completed:** _still running_
+**CPU job completed:** `2026-04-21T16:03:05Z`
+
+## Key Numbers for Slides (updated)
+
+```
+GPU Feature Engineering Speedup:    1.51× overall  (CPU 7,057s → RAPIDS 4,755s)
+Best stage speedup:                  1.74× (item feature aggregation)
+Throughput improvement:             +51%  (20,026 → 30,159 rows/s)
+Rows processed:                     140.8M rows, 49 GB full dataset
+Unique users materialized to Redis:  35M
+Unique items in feature store:        9.8M
+```
 
 ```bash
 # Reproduce metrics from driver logs:
