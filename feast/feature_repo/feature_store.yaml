@@ -57,42 +57,58 @@ offline_store:
   staging_location: "s3://smartshop-features/feast-staging/"
 
 # batch_engine: controls how feast materialize-incremental writes to the online store.
-# SparkComputeEngine runs a SparkSession local[*] inside the feast-server pod.
-# Injected by the operator via feast-spark-engine ConfigMap when running on-cluster;
-# defined here for local dev and as the canonical source of truth.
 #
-# Source-verified fields (SparkComputeEngineConfig in compute_engines/spark/compute.py):
-#   type, spark_conf, staging_location, region, partitions
+# SparkComputeEngine passes the ENTIRE batch_engine dict (flat) to SparkConf().setAll().
+# All Spark config keys must be at the TOP LEVEL — NOT nested under spark_conf.
+# (source: compute_engines/spark/utils.py get_or_create_new_spark_session)
 #
-# NOTE: SparkComputeEngine passes the entire batch_engine dict to SparkConf().setAll()
-# NOT just the nested spark_conf. Spark session config should live in offline_store.spark_conf
-# which is reliably applied via get_spark_session_or_start_new_with_repoconfig().
-# The spark_conf here is kept for operator injection (feast-spark-engine ConfigMap) only.
+# spark.master: k8s://... → Feast pod acts as Spark driver, spawns executor pods on K8s.
+# This gives truly distributed materialization (not local[*] single JVM).
+# The Feast pod needs the spark serviceAccount and driver bind address configured so
+# executors can call back to the driver inside the pod.
 #
-# partitions: controls repartitioning before Redis writes (top-level field, NOT spark conf).
-# For 35M users + 9.8M items — 200 partitions keeps Redis pipeline writes bounded.
+# partitions: 200 — SparkComputeEngineConfig top-level field; controls repartitioning
+# before Redis writes. Separate from spark.sql.shuffle.partitions.
 batch_engine:
   type: spark.engine
   partitions: 200
-  spark_conf:
-    spark.master: "local[*]"
-    spark.ui.enabled: "false"
-    spark.eventLog.enabled: "false"
-    spark.sql.session.timeZone: "UTC"
-    spark.sql.execution.arrow.pyspark.enabled: "true"
-    spark.sql.execution.arrow.fallback.enabled: "true"
-    spark.sql.shuffle.partitions: "200"
-    spark.default.parallelism: "200"
-    spark.driver.memory: "8g"
-    spark.executor.memory: "8g"
-    spark.sql.execution.arrow.maxRecordsPerBatch: "50000"
-    spark.hadoop.fs.s3a.endpoint: "${AWS_ENDPOINT_URL_S3:-http://minio.smartshop.svc.cluster.local:9000}"
-    spark.hadoop.fs.s3a.path.style.access: "true"
-    spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
-    spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
-    spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
-    spark.hadoop.fs.s3a.connection.maximum: "100"
-    spark.hadoop.fs.s3a.threads.max: "64"
+  # Spark on Kubernetes — Feast pod is the driver, executor pods launched on-demand
+  spark.master: "k8s://https://api.oai-kft-ibm.ibm.rh-ods.com:6443"
+  spark.kubernetes.namespace: "smartshop"
+  spark.kubernetes.container.image: "quay.io/abdhumal/smartshop-feast-spark-server:latest"
+  spark.kubernetes.authenticate.driver.serviceAccountName: "spark"
+  # Driver must bind to all interfaces so executor pods can connect back
+  spark.driver.bindAddress: "0.0.0.0"
+  spark.driver.host: "feast-smartshop-feast-offline.smartshop.svc.cluster.local"
+  spark.driver.port: "7078"
+  spark.driver.blockManager.port: "7079"
+  spark.driver.memory: "4g"
+  spark.driver.cores: "2"
+  # Executor pods — 4 instances, 8g each matches SparkApplication executor config
+  spark.executor.memory: "8g"
+  spark.executor.cores: "4"
+  spark.executor.instances: "4"
+  spark.kubernetes.executor.request.cores: "100m"
+  # Work dir volumes required on OpenShift (no root, emptyDir)
+  spark.kubernetes.driver.volumes.emptyDir.spark-work-dir.mount.path: "/opt/spark/work-dir"
+  spark.kubernetes.executor.volumes.emptyDir.spark-work-dir.mount.path: "/opt/spark/work-dir"
+  # SQL / Arrow settings
+  spark.sql.session.timeZone: "UTC"
+  spark.sql.shuffle.partitions: "200"
+  spark.default.parallelism: "200"
+  spark.sql.execution.arrow.pyspark.enabled: "true"
+  spark.sql.execution.arrow.fallback.enabled: "true"
+  spark.sql.execution.arrow.maxRecordsPerBatch: "50000"
+  spark.task.maxFailures: "3"
+  spark.executor.maxNumFailures: "3"
+  # s3a MinIO — same credentials as SparkApplications
+  spark.hadoop.fs.s3a.endpoint: "${AWS_ENDPOINT_URL_S3:-http://minio.smartshop.svc.cluster.local:9000}"
+  spark.hadoop.fs.s3a.path.style.access: "true"
+  spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+  spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+  spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+  spark.hadoop.fs.s3a.connection.maximum: "100"
+  spark.hadoop.fs.s3a.threads.max: "64"
 
 online_store:
   type: redis
