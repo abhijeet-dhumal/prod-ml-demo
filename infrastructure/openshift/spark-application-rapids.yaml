@@ -91,6 +91,11 @@ spec:
     spark.executor.processTreeMetrics.enabled: "true"
     # Metrics config file (mounted from spark-metrics-config ConfigMap)
     spark.metrics.conf: "/etc/spark-metrics/metrics.properties"
+    # Spark History Server — event logs written to MinIO s3a://
+    spark.eventLog.enabled: "true"
+    spark.eventLog.dir: "s3a://smartshop-spark-logs/rapids"
+    spark.eventLog.compress: "true"
+    spark.history.fs.logDirectory: "s3a://smartshop-spark-logs/rapids"
   driver:
     cores: ${SPARK_DRIVER_CORES:-2}
     memory: "${SPARK_DRIVER_MEMORY:-4g}"

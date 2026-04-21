@@ -50,6 +50,11 @@ spec:
     spark.ui.prometheus.enabled: "true"
     spark.executor.processTreeMetrics.enabled: "true"
     spark.metrics.conf: "/etc/spark-metrics/metrics.properties"
+    # Spark History Server — event logs written to MinIO s3a://
+    spark.eventLog.enabled: "true"
+    spark.eventLog.dir: "s3a://smartshop-spark-logs/embedding"
+    spark.eventLog.compress: "true"
+    spark.history.fs.logDirectory: "s3a://smartshop-spark-logs/embedding"
     # Transformers model download cache → /tmp (work-dir not writable by uid 1001 without rebuild)
     spark.executorEnv.TRANSFORMERS_CACHE: "/tmp/hf-cache"
     spark.executorEnv.HF_HOME: "/tmp/hf-home"
