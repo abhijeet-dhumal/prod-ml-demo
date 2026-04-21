@@ -156,8 +156,10 @@ spec:
       noCache: false
   output:
     to:
-      kind: ImageStreamTag
-      name: feast-spark-server:latest
+      kind: DockerImage
+      name: ${REGISTRY}/smartshop-feast-spark-server:latest
+    pushSecret:
+      name: ${QUAY_PUSH_SECRET}
   resources:
     limits:
       cpu: "4"

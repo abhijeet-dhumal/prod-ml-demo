@@ -44,7 +44,8 @@ spec:
             name: feast-spark-config
       server:
         # Custom image: feature-server:0.62.0 + pyspark==4.0.0 + hadoop-aws JARs
-        image: image-registry.openshift-image-registry.svc:5000/${NAMESPACE}/feast-spark-server:latest
+        # Built by: oc start-build feast-spark-server → pushed to quay.io/abdhumal/smartshop-feast-spark-server
+        image: ${FEAST_SERVER_IMAGE}
         envFrom:
           - secretRef:
               name: feast-s3-credentials  # AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
@@ -56,7 +57,7 @@ spec:
           secretRef:
             name: feast-redis-secret
       server:
-        image: image-registry.openshift-image-registry.svc:5000/${NAMESPACE}/feast-spark-server:latest
+        image: ${FEAST_SERVER_IMAGE}
         envFrom:
           - secretRef:
               name: feast-s3-credentials
@@ -77,7 +78,7 @@ spec:
                 storageClassName: nfs-csi
               mountPath: /feast-registry
         server:
-          image: image-registry.openshift-image-registry.svc:5000/${NAMESPACE}/feast-spark-server:latest
+          image: ${FEAST_SERVER_IMAGE}
           envFrom:
             - secretRef:
                 name: feast-s3-credentials
