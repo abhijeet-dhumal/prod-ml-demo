@@ -112,6 +112,9 @@ spec:
       - name: feature-engineering-script
         mountPath: /opt/spark/work-dir/feature_engineering.py
         subPath: feature_engineering.py
+      - name: mlflow-metrics-script
+        mountPath: /opt/spark/work-dir/utils/mlflow_metrics.py
+        subPath: mlflow_metrics.py
   executor:
     cores: ${SPARK_EXECUTOR_CORES:-4}
     instances: ${SPARK_EXECUTOR_INSTANCES:-4}
@@ -131,6 +134,9 @@ spec:
       - name: feature-engineering-script
         mountPath: /opt/spark/work-dir/feature_engineering.py
         subPath: feature_engineering.py
+      - name: mlflow-metrics-script
+        mountPath: /opt/spark/work-dir/utils/mlflow_metrics.py
+        subPath: mlflow_metrics.py
       - name: gpu-discovery-script
         mountPath: /tmp/getGpusResources.sh
         subPath: getGpusResources.sh
@@ -141,6 +147,10 @@ spec:
     - name: feature-engineering-script
       configMap:
         name: smartshop-feature-engineering-script
+        defaultMode: 0644
+    - name: mlflow-metrics-script
+      configMap:
+        name: spark-mlflow-metrics-script
         defaultMode: 0644
     - name: gpu-discovery-script
       configMap:
