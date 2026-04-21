@@ -68,6 +68,12 @@ class SparkRunLogger:
 
         if self._enabled:
             mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+            workspace = os.environ.get("MLFLOW_WORKSPACE")
+            if workspace and hasattr(mlflow, "set_workspace"):
+                try:
+                    mlflow.set_workspace(workspace)
+                except Exception:
+                    pass
             mlflow.set_experiment(experiment)
 
     @contextmanager

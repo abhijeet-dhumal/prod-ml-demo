@@ -171,19 +171,19 @@ data:
           tlsSkipVerify: true
           httpHeaderName1: "Authorization"
         secureJsonData:
-          httpHeaderValue1: "Bearer $__file{/var/run/secrets/kubernetes.io/serviceaccount/token}"
-      - name: OCP-UserWorkload
-        type: prometheus
-        uid: ocp-uwm
-        url: https://thanos-querier.openshift-monitoring.svc.cluster.local:9092
-        access: proxy
-        jsonData:
-          httpMethod: POST
-          timeInterval: "15s"
-          tlsSkipVerify: true
-          httpHeaderName1: "Authorization"
-        secureJsonData:
-          httpHeaderValue1: "Bearer $__file{/var/run/secrets/kubernetes.io/serviceaccount/token}"
+          httpHeaderValue1: "Bearer ${PROMETHEUS_TOKEN}"
+  - name: OCP-UserWorkload
+    type: prometheus
+    uid: ocp-uwm
+    url: https://thanos-querier.openshift-monitoring.svc.cluster.local:9092
+    access: proxy
+    jsonData:
+      httpMethod: POST
+      timeInterval: "15s"
+      tlsSkipVerify: true
+      httpHeaderName1: "Authorization"
+    secureJsonData:
+      httpHeaderValue1: "Bearer ${PROMETHEUS_TOKEN}"
 
 ---
 # Dashboard provisioning config — tells Grafana where to find dashboard JSON files
@@ -243,7 +243,7 @@ data:
           "id": 3, "title": "SM Active Ratio (0=idle, 1=fully loaded)",
           "type": "timeseries", "gridPos": {"x":0,"y":8,"w":12,"h":8},
           "targets": [{"datasource": "ocp-thanos",
-            "expr": "DCGM_FI_PROF_SM_ACTIVE",
+            "expr": "DCGM_FI_PROF_GR_ENGINE_ACTIVE",
             "legendFormat": "GPU {{gpu}}"}]
         },
         {

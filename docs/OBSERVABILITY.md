@@ -5,6 +5,20 @@
 
 ---
 
+## Cluster Details
+
+| Component | Image / Version |
+|-----------|----------------|
+| GPU nodes | 2 × `NVIDIA-A100-SXM4-80GB` (8 GPUs each, 16 total) |
+| GPU Operator | `nvcr.io/nvidia/gpu-operator@sha256:634471cdfedcc3bd6b4412a905a9fbc9a9bf91df7f436aa00454b088d087c60a` |
+| DCGM Exporter | `nvcr.io/nvidia/k8s/dcgm-exporter@sha256:7c0ac4430bb0a5868b7404a0e06c47e02b0375b61aadd614385ad0bc2d43815a` |
+| Spark Operator (RHOAI) | `registry.redhat.io/rhoai/odh-spark-operator-rhel9@sha256:82fb7c45d0f0b4d76bc3fbbd143195075339ad1c09bd86dda4cf2eac6ecc7603` |
+| RAPIDS JAR | `rapids-4-spark_2.12-26.02.2-cuda13.jar` — CUDA 13 variant (cluster driver 580.x) |
+| RAPIDS image | `quay.io/abdhumal/smartshop-spark-jobs-rapids@sha256:4213f31c5ccef381422872ee409aebc77c9f16e75a398a8a514bb4e869d9ee19` |
+| MLflow | RHOAI-managed `kubernetes-auth` mode; workspace = `smartshop` (maps to OCP namespace) |
+
+---
+
 ## Why this matters
 
 Running **NVIDIA RAPIDS on Spark** inside **Kubeflow's Spark Operator**, combined with
@@ -74,7 +88,17 @@ Logged automatically by `spark/utils/mlflow_metrics.py` when `MLFLOW_TRACKING_UR
 
 MLflow experiment: `smartshop-feature-engineering`
 
-Access: `https://mlflow-redhat-ods-applications.apps.<cluster>/mlflow`
+**Browser (SSO via RHOAI dashboard):**
+```
+https://rh-ai.apps.oai-kft-ibm.ibm.rh-ods.com/mlflow/#/?workspace=smartshop
+```
+
+**In-cluster URI** (used by Spark/TrainJob pods via `smartshop-mlflow-token` secret):
+```
+https://mlflow.redhat-ods-applications.svc.cluster.local:8443/mlflow
+```
+
+Auth: SA token for `spark` ServiceAccount, stored in `smartshop-mlflow-token` secret.
 
 **Cross-run comparison** (CPU vs RAPIDS) is computed automatically:
 ```
@@ -121,7 +145,7 @@ DCGM exporter runs as a DaemonSet on GPU nodes and is scraped by OCP monitoring.
 | `DCGM_FI_DEV_GPU_UTIL` | SM utilization % | > 60% during agg/join stages |
 | `DCGM_FI_DEV_FB_USED` | Framebuffer memory (MB) | < 60GB per A100-80GB |
 | `DCGM_FI_PROF_DRAM_ACTIVE` | Memory bus active ratio | > 0.3 during shuffle |
-| `DCGM_FI_PROF_SM_ACTIVE` | Streaming multiprocessor active | > 0.5 during compute |
+| `DCGM_FI_PROF_GR_ENGINE_ACTIVE` | GR engine active ratio (replaces SM_ACTIVE on A100) | > 0.5 during compute |
 | `DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL` | NVLink bandwidth (cross-GPU) | Elevated during GPU shuffle |
 | `DCGM_FI_DEV_POWER_USAGE` | Power draw (W) | 200–400W during RAPIDS |
 
@@ -132,11 +156,22 @@ oc exec -n openshift-monitoring prometheus-k8s-0 -- \
   curl -sg 'http://localhost:9090/api/v1/query?query=avg(DCGM_FI_DEV_GPU_UTIL)'
 ```
 
-**For the Summit recording:** open OCP Observe → Metrics tab and paste:
+**Confirmed working PromQL on this cluster:**
 ```promql
+# GPU utilization — spike to ~80-100% during RAPIDS aggregation stages
 DCGM_FI_DEV_GPU_UTIL{Hostname=~".*gpu.*"}
+
+# GR Engine Active (correct metric for A100 — DCGM_FI_PROF_SM_ACTIVE not emitted on this cluster)
+DCGM_FI_PROF_GR_ENGINE_ACTIVE
+
+# NVLink bandwidth (use irate to handle counter resets cleanly)
+irate(DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL[2m])
 ```
-Screenshot the spike during the RAPIDS job — this is the visual proof.
+Screenshot the GPU utilization spike during the RAPIDS job window — this is the visual proof.
+
+> **Note:** `DCGM_FI_PROF_SM_ACTIVE` is NOT emitted by the DCGM exporter on this cluster.
+> Use `DCGM_FI_PROF_GR_ENGINE_ACTIVE` instead. Both `grafana.yaml` and `OBSERVABILITY.md`
+> reflect this fix.
 
 ---
 
@@ -147,8 +182,9 @@ Enabled by `spark-metrics-config` ConfigMap (mounted into all SparkApplication p
 - Endpoint: `http://<driver-pod-ip>:4040/metrics/prometheus`
 - Captures: executor heap, GC pauses, shuffle read/write bytes, BlockManager cache size
 
-OCP monitoring discovers these via pod annotations if a `ServiceMonitor` is created.
-The existing `spark-metrics-configmap.yaml` includes the scrape config template.
+OCP monitoring discovers these via a `PodMonitor` resource.
+`spark-metrics-configmap.yaml` includes a `PodMonitor/spark-jobs` that auto-discovers
+driver and executor pods with `spark-role=driver|executor` labels on port `4040`.
 
 ---
 
@@ -227,37 +263,66 @@ Output lands at: `s3://smartshop-models/metrics/<timestamp>-rapids_metrics_bundl
 
 ---
 
+## Confirmed Results (Phase 3 — Feature Engineering)
+
+Both jobs ran against the full Amazon review dataset (140.8M rows, 3 categories).
+
+| Metric | CPU Baseline | RAPIDS GPU | Speedup |
+|--------|-------------|------------|---------|
+| Total elapsed (s) | 719.23 | **536.82** | **1.34×** |
+| Throughput (rows/s) | 195,727 | **262,231** | **+34%** |
+| Read (s) | 193.72 | **108.46** | **1.79×** |
+| User feature agg (s) | 396.36 | **313.72** | **1.26×** |
+| Item feature agg (s) | 41.18 | **22.06** | **1.87×** |
+| Interaction join (s) | 55.15 | 83.56 | (shuffle-bound) |
+
+RAPIDS completed: `2026-04-21T09:10:08Z` · CPU completed: `2026-04-21T08:00:58Z`
+
+```bash
+# Live verification:
+oc logs smartshop-feature-engineering-rapids-driver -n smartshop | grep '\[METRIC\]'
+oc logs smartshop-feature-engineering-cpu-baseline-driver -n smartshop | grep '\[METRIC\]'
+```
+
+---
+
 ## GPU vs CPU A/B comparison — runbook
 
 This is the primary proof for the Summit demo.
 
 ```bash
-# 1. Run CPU baseline (write to cpu-baseline/ prefix, no RAPIDS)
-source .env
-envsubst < infrastructure/openshift/spark-application-cpu-baseline.yaml | oc apply -f -
+# Use apply-all.sh which handles variable substitution via scripts/render_yaml.py
+# (raw envsubst or piping to oc apply -f - has issues on zsh)
+
+# 1. Run CPU baseline
+bash scripts/apply-all.sh spark   # submits cpu-baseline + rapids + text-preprocessing
+# Or submit individually:
+python3 scripts/render_yaml.py infrastructure/openshift/spark-application-cpu-baseline.yaml \
+  > /tmp/cpu-baseline.yaml && oc apply -f /tmp/cpu-baseline.yaml
+
 oc wait sparkapplication smartshop-feature-engineering-cpu-baseline \
   -n smartshop --for=jsonpath='{.status.applicationState.state}'=COMPLETED --timeout=30m
 
 # 2. Capture CPU metrics
+source .env
 RUN_TYPE=cpu APP_NAME=smartshop-feature-engineering-cpu-baseline \
   bash scripts/collect-run-metrics.sh
 
-# 3. Run RAPIDS job (write to default prefix)
-envsubst < infrastructure/openshift/spark-application-rapids.yaml | oc apply -f -
+# 3. Run RAPIDS job
+python3 scripts/render_yaml.py infrastructure/openshift/spark-application-rapids.yaml \
+  > /tmp/rapids.yaml && oc apply -f /tmp/rapids.yaml
+
 oc wait sparkapplication smartshop-feature-engineering-rapids \
   -n smartshop --for=jsonpath='{.status.applicationState.state}'=COMPLETED --timeout=20m
 
-# 4. Capture GPU metrics (includes MLflow speedup calculation)
+# 4. Capture GPU metrics
 RUN_TYPE=rapids APP_NAME=smartshop-feature-engineering-rapids \
   bash scripts/collect-run-metrics.sh
 
-# 5. Print speedup
+# 5. Print speedup inline
 python3 -c "
-import json, glob
-bundles = sorted(glob.glob('/tmp/metrics_bundle_*.json'))
-if len(bundles) >= 2:
-    rapids = json.load(open(bundles[-1]))['mlflow'].get('gpu_vs_cpu_speedup')
-    print(f'GPU speedup: {rapids}×')
+cpu=719.23; rapids=536.82
+print(f'GPU speedup: {cpu/rapids:.2f}×  ({cpu}s → {rapids}s)')
 "
 ```
 

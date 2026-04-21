@@ -79,24 +79,9 @@ spec:
             name: smartshop-collect-script
             defaultMode: 0755
 
----
-# Embeds the collect-run-metrics.sh into a ConfigMap so the Job is self-contained.
-# To update the script: edit scripts/collect-run-metrics.sh and re-apply this manifest.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: smartshop-collect-script
-  namespace: ${NAMESPACE}
-  labels:
-    app: smartshop
-    component: observability
-data:
-  collect-run-metrics.sh: |
-    # Inline placeholder — the actual script is mounted from the host via `oc apply`.
-    # To populate: replace this value with the contents of scripts/collect-run-metrics.sh.
-    # Or use a separate apply step:
-    #   oc create configmap smartshop-collect-script \
-    #     --from-file=collect-run-metrics.sh=scripts/collect-run-metrics.sh \
-    #     -n smartshop --dry-run=client -o yaml | oc apply -f -
-    echo "ERROR: replace this placeholder with the actual script content"
-    exit 1
+# NOTE: smartshop-collect-script ConfigMap must exist before the Job runs.
+# Create/update it with:
+#   oc create configmap smartshop-collect-script \
+#     --from-file=collect-run-metrics.sh=scripts/collect-run-metrics.sh \
+#     -n smartshop --dry-run=client -o yaml | oc apply -f -
+# This is automated by scripts/apply-all.sh (step: observability)

@@ -1,4 +1,4 @@
-# RAPIDS spark image — feature engineering only (no Feast, Python 3.8 compatible)
+# RAPIDS spark image — feature engineering, text preprocessing, embedding generation
 # Base image apache/spark:3.5.3 ships Python 3.8 (Ubuntu 20.04 focal).
 # Feast >=0.60 requires Python 3.9+ so it's intentionally excluded here.
 # Feast materialization runs separately in the main spark-jobs image (UBI9/Python 3.12).
@@ -7,3 +7,7 @@ pandas>=2.0.0,<2.2.0
 pyarrow>=14.0.0,<15.0.0
 fsspec>=2024.2.0
 s3fs>=2024.2.0
+# Required for embedding_generation.py (Phase 3c)
+sentence-transformers==3.3.1
+# MLflow metrics logging
+mlflow>=2.10.0

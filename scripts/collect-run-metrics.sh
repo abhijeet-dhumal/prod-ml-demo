@@ -401,7 +401,7 @@ PYEOF
 collect_feast_metrics() {
     log "Collecting Feast metrics..."
 
-    FEAST_POD=$(oc get pod -n "${NAMESPACE}" -l "app=feast-smartshop-feast" \
+    FEAST_POD=$(oc get pod -n "${NAMESPACE}" -l "feast.dev/name=smartshop-feast" \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 
     python3 - <<PYEOF > /tmp/feast_metrics.json

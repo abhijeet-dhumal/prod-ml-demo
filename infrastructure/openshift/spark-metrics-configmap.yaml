@@ -50,17 +50,29 @@ data:
     # *.sink.csv.unit=seconds
     # *.sink.csv.directory=/tmp/spark-metrics-csv
 
-  # Prometheus scrape config for OCP ServiceMonitor (if manual scraping is needed)
-  # Mount this file at /etc/prometheus/spark-scrape.yaml and reference it.
   spark-scrape-config.yaml: |
-    scrape_configs:
-      - job_name: spark-driver
-        static_configs:
-          - targets: ['<driver-pod-ip>:4040']
-        metrics_path: /metrics/prometheus
-        scrape_interval: 15s
-      - job_name: spark-executors
-        static_configs:
-          - targets: ['<executor-pod-ip>:4040']
-        metrics_path: /metrics/prometheus
-        scrape_interval: 15s
+    # Informational only — OCP ServiceMonitor below handles actual scraping.
+
+---
+# PodMonitor — scrapes Spark driver + executor pods at :4040/metrics/prometheus.
+# OCP user-workload monitoring picks this up automatically.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: spark-jobs
+  namespace: ${NAMESPACE}
+  labels:
+    app: smartshop
+    component: observability
+    prometheus: user-workload
+spec:
+  selector:
+    matchExpressions:
+      - key: spark-role
+        operator: In
+        values: [driver, executor]
+  podMetricsEndpoints:
+    - port: "4040"
+      path: /metrics/prometheus
+      interval: 15s
+      scheme: http

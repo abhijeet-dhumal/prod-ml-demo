@@ -11,7 +11,9 @@ Usage (multi-node via Kubeflow Trainer):
 """
 
 import argparse
+import io
 import os
+import time
 
 import pandas as pd
 import torch
@@ -20,16 +22,57 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
+import mlflow
+import mlflow.pytorch
+
+try:
+    import fsspec
+    HAS_FSSPEC = True
+except ImportError:
+    HAS_FSSPEC = False
+
 from model import TwoTowerModel
+
+
+def _is_s3(path: str) -> bool:
+    return path.startswith("s3://") or path.startswith("s3a://")
+
+
+def _save_checkpoint(state: dict, path: str) -> None:
+    """Save a PyTorch checkpoint to local or S3 path."""
+    if _is_s3(path) and HAS_FSSPEC:
+        buf = io.BytesIO()
+        torch.save(state, buf)
+        buf.seek(0)
+        endpoint = os.environ.get("AWS_ENDPOINT_URL_S3", os.environ.get("S3_ENDPOINT", ""))
+        storage_opts = {}
+        if endpoint:
+            storage_opts = {
+                "key": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+                "secret": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+                "client_kwargs": {"endpoint_url": endpoint},
+            }
+        with fsspec.open(path, "wb", **storage_opts) as f:
+            f.write(buf.read())
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(state, path)
 
 
 class RecommendationDataset(Dataset):
     """Dataset that loads user-item interactions with Feast features."""
 
-    def __init__(self, interactions_path: str, user_features_path: str, item_features_path: str):
-        self.interactions = pd.read_parquet(interactions_path)
-        user_feats = pd.read_parquet(user_features_path)
-        item_feats = pd.read_parquet(item_features_path)
+    def __init__(
+        self,
+        interactions_path: str,
+        user_features_path: str,
+        item_features_path: str,
+        storage_options: dict = None,
+    ):
+        kw = {"storage_options": storage_options} if storage_options else {}
+        self.interactions = pd.read_parquet(interactions_path, **kw)
+        user_feats = pd.read_parquet(user_features_path, **kw)
+        item_feats = pd.read_parquet(item_features_path, **kw)
 
         # Build ID mappings
         all_users = self.interactions["user_id"].unique()
@@ -165,8 +208,8 @@ def evaluate(model, dataloader, criterion, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="data/processed", help="Feature data directory")
-    parser.add_argument("--output-dir", default="models/recommendation", help="Model output dir")
+    parser.add_argument("--data-dir", default="data/processed", help="Feature data directory (s3:// or local)")
+    parser.add_argument("--output-dir", default="models/recommendation", help="Model output dir (s3:// or local)")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -176,15 +219,46 @@ def main():
 
     rank, local_rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    job_start = time.time()
 
     if rank == 0:
         print(f"Training with {world_size} processes on {device}")
+        mlflow_uri = os.environ.get("MLFLOW_TRACKING_URI")
+        if mlflow_uri:
+            mlflow.set_tracking_uri(mlflow_uri)
+        if os.environ.get("MLFLOW_TRACKING_INSECURE_TLS", "").lower() in ("true", "1"):
+            os.environ["MLFLOW_TRACKING_INSECURE_TLS"] = "true"
+        mlflow.set_experiment("smartshop-rec-training")
+        run = mlflow.start_run(
+            run_name=f"two-tower-ddp-{world_size}gpu-{args.epochs}ep"
+        )
+        mlflow.log_params({
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "embed_dim": args.embed_dim,
+            "hidden_dim": args.hidden_dim,
+            "world_size": world_size,
+            "device": str(device),
+            "data_dir": args.data_dir,
+        })
 
-    # Load dataset
+    # Load dataset — pandas reads S3 via s3fs if installed
+    storage_options = None
+    if _is_s3(args.data_dir):
+        endpoint = os.environ.get("AWS_ENDPOINT_URL_S3", os.environ.get("S3_ENDPOINT", ""))
+        if endpoint:
+            storage_options = {
+                "key": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+                "secret": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+                "client_kwargs": {"endpoint_url": endpoint},
+            }
+
     dataset = RecommendationDataset(
         interactions_path=f"{args.data_dir}/interactions",
         user_features_path=f"{args.data_dir}/user_features",
         item_features_path=f"{args.data_dir}/item_features",
+        storage_options=storage_options,
     )
 
     # Train/val split
@@ -197,6 +271,12 @@ def main():
     if rank == 0:
         print(f"Users: {dataset.num_users:,}, Items: {dataset.num_items:,}")
         print(f"Train: {train_size:,}, Val: {val_size:,}")
+        mlflow.log_params({
+            "num_users": dataset.num_users,
+            "num_items": dataset.num_items,
+            "train_size": train_size,
+            "val_size": val_size,
+        })
 
     # Distributed sampler
     train_sampler = DistributedSampler(train_dataset) if world_size > 1 else None
@@ -244,41 +324,66 @@ def main():
         scheduler.step()
 
         if rank == 0:
+            elapsed = time.time() - job_start
+            throughput = int(len(train_dataset) / (elapsed / (epoch + 1)))
             print(
                 f"Epoch {epoch+1}/{args.epochs} | "
                 f"Train Loss: {train_loss:.4f} | "
                 f"Val Loss: {val_loss:.4f} | "
-                f"Val Acc: {val_acc:.4f}"
+                f"Val Acc: {val_acc:.4f} | "
+                f"Throughput: {throughput:,} samples/s"
+            )
+            mlflow.log_metrics(
+                {
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_accuracy": val_acc,
+                    "throughput_samples_per_s": throughput,
+                    "elapsed_s": round(elapsed, 1),
+                },
+                step=epoch + 1,
             )
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                os.makedirs(args.output_dir, exist_ok=True)
+                ckpt_path = f"{args.output_dir}/best_model.pt"
                 raw_model = model.module if hasattr(model, "module") else model
-                torch.save(
-                    {
-                        "model_state_dict": raw_model.state_dict(),
-                        "num_users": dataset.num_users,
-                        "num_items": dataset.num_items,
-                        "user_to_idx": dataset.user_to_idx,
-                        "item_to_idx": dataset.item_to_idx,
-                        "user_feat_dim": len(dataset.user_feat_cols),
-                        "item_feat_dim": len(dataset.item_feat_cols),
-                        "embed_dim": args.embed_dim,
-                        "hidden_dim": args.hidden_dim,
-                        "val_loss": val_loss,
-                        "val_accuracy": val_acc,
-                        "epoch": epoch + 1,
-                    },
-                    f"{args.output_dir}/best_model.pt",
-                )
-                print(f"  Saved best model (val_loss={val_loss:.4f})")
+                state = {
+                    "model_state_dict": raw_model.state_dict(),
+                    "num_users": dataset.num_users,
+                    "num_items": dataset.num_items,
+                    "user_to_idx": dataset.user_to_idx,
+                    "item_to_idx": dataset.item_to_idx,
+                    "user_feat_dim": len(dataset.user_feat_cols),
+                    "item_feat_dim": len(dataset.item_feat_cols),
+                    "embed_dim": args.embed_dim,
+                    "hidden_dim": args.hidden_dim,
+                    "val_loss": val_loss,
+                    "val_accuracy": val_acc,
+                    "epoch": epoch + 1,
+                }
+                _save_checkpoint(state, ckpt_path)
+                mlflow.log_metric("best_val_loss", best_val_loss, step=epoch + 1)
+                print(f"  Saved best model → {ckpt_path} (val_loss={val_loss:.4f})")
 
     if world_size > 1:
         dist.destroy_process_group()
 
     if rank == 0:
-        print(f"Training complete. Best val loss: {best_val_loss:.4f}")
+        total_time = time.time() - job_start
+        mlflow.log_metrics({
+            "best_val_loss": best_val_loss,
+            "total_training_time_s": round(total_time, 1),
+        })
+        mlflow.end_run()
+        print(
+            f"\n{'='*60}\n"
+            f"Training complete.\n"
+            f"  Best val loss : {best_val_loss:.4f}\n"
+            f"  Total time    : {total_time:.1f}s\n"
+            f"  Model saved   : {args.output_dir}/best_model.pt\n"
+            f"{'='*60}"
+        )
 
 
 if __name__ == "__main__":

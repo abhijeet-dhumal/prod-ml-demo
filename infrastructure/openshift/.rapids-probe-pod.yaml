@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rapids-probe
+  namespace: smartshop
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: quay.io/abdhumal/smartshop-spark-jobs-rapids:latest
+      command: [sh, -c]
+      args:
+        - |
+          echo "=== RAPIDS JAR check ==="
+          ls -lh /opt/spark/jars/rapids-4-spark.jar 2>&1 || echo "NOT FOUND"
+          echo "=== JAR class check ==="
+          jar tf /opt/spark/jars/rapids-4-spark.jar 2>/dev/null | grep "SQLPlugin.class" | head -3 || echo "jar command not available"
+          echo "=== All jars in /opt/spark/jars/ count ==="
+          ls /opt/spark/jars/ | wc -l

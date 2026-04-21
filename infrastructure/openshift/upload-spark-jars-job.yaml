@@ -1,0 +1,59 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: upload-spark-jars
+  namespace: smartshop
+spec:
+  ttlSecondsAfterFinished: 7200
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: uploader
+          image: quay.io/abdhumal/smartshop-spark-jobs:latest
+          command: ["python3.12", "-c"]
+          args:
+            - |
+              import requests, s3fs, os, io
+              print("=== Spark JAR upload ===", flush=True)
+
+              fs = s3fs.S3FileSystem(
+                  key=os.environ["AWS_ACCESS_KEY_ID"],
+                  secret=os.environ["AWS_SECRET_ACCESS_KEY"],
+                  endpoint_url="http://minio.smartshop.svc.cluster.local:9000",
+                  use_ssl=False)
+
+              BUCKET = "smartshop-raw"
+              JARS = [
+                  ("jars/hadoop-aws-3.3.4.jar",
+                   "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar"),
+                  ("jars/aws-java-sdk-bundle-1.12.262.jar",
+                   "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar"),
+              ]
+
+              for key, url in JARS:
+                  s3path = f"{BUCKET}/{key}"
+                  name = key.split("/")[-1]
+                  if fs.exists(s3path):
+                      print(f"SKIP {name} (already exists)", flush=True); continue
+                  print(f"Downloading {name} ...", flush=True)
+                  resp = requests.get(url, stream=True, timeout=600)
+                  resp.raise_for_status()
+                  total = int(resp.headers.get("content-length", 0))
+                  downloaded = 0
+                  with fs.open(s3path, "wb") as out:
+                      for chunk in resp.iter_content(chunk_size=4*1024*1024):
+                          out.write(chunk)
+                          downloaded += len(chunk)
+                          if downloaded % (50*1024*1024) < 4*1024*1024:
+                              print(f"  {downloaded/1e6:.0f}/{total/1e6:.0f} MB", flush=True)
+                  print(f"DONE: {name} ({downloaded/1e6:.0f} MB)", flush=True)
+
+              print("=== All Spark JARs uploaded to MinIO ===", flush=True)
+          envFrom:
+            - secretRef:
+                name: smartshop-credentials
+          resources:
+            requests: {cpu: "1", memory: 1Gi}
+            limits: {cpu: "2", memory: 4Gi}

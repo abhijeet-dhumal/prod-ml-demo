@@ -1,4 +1,50 @@
 ---
+# TrainingRuntime for DDP recommendation training
+# Uses envFrom to pull all credentials + MLflow config from secrets.
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainingRuntime
+metadata:
+  name: smartshop-rec-ddp
+  namespace: ${NAMESPACE}
+spec:
+  template:
+    spec:
+      replicatedJobs:
+        - name: worker
+          template:
+            spec:
+              template:
+                spec:
+                  containers:
+                    - name: trainer
+                      envFrom:
+                        - secretRef:
+                            name: smartshop-credentials
+                        - secretRef:
+                            name: smartshop-mlflow-token
+                      env:
+                        - name: FEAST_REPO_PATH
+                          value: "${FEAST_REPO_PATH}"
+                        - name: S3_ENDPOINT
+                          value: "${MINIO_ENDPOINT}"
+                        - name: AWS_ENDPOINT_URL_S3
+                          value: "${MINIO_ENDPOINT}"
+                        - name: AWS_DEFAULT_REGION
+                          value: "${AWS_DEFAULT_REGION}"
+                        - name: HF_HOME
+                          value: "${HF_HOME}"
+                        - name: NCCL_DEBUG
+                          value: "INFO"
+                      volumeMounts:
+                        - name: shm
+                          mountPath: /dev/shm
+                  volumes:
+                    - name: shm
+                      emptyDir:
+                        medium: Memory
+                        sizeLimit: "8Gi"
+
+---
 # Kubeflow Trainer - Recommendation Model (DDP on K8s)
 apiVersion: trainer.kubeflow.org/v1alpha1
 kind: TrainJob
@@ -33,12 +79,11 @@ spec:
         nvidia.com/gpu: "${REC_GPUS_PER_NODE}"
 
 ---
-# TrainingRuntime for DDP recommendation training
+# ClusterTrainingRuntime for FSDP LLM training dispatched to Slurm
 apiVersion: trainer.kubeflow.org/v1alpha1
-kind: TrainingRuntime
+kind: ClusterTrainingRuntime
 metadata:
-  name: smartshop-rec-ddp
-  namespace: ${NAMESPACE}
+  name: smartshop-llm-fsdp-slurm
 spec:
   template:
     spec:
@@ -50,27 +95,29 @@ spec:
                 spec:
                   containers:
                     - name: trainer
+                      envFrom:
+                        - secretRef:
+                            name: smartshop-credentials
+                        - secretRef:
+                            name: smartshop-mlflow-token
+                        - secretRef:
+                            name: hf-credentials
                       env:
-                        - name: FEAST_REPO_PATH
-                          value: "${FEAST_REPO_PATH}"
+                        - name: HF_HOME
+                          value: "${HF_HOME}"
                         - name: S3_ENDPOINT
                           value: "${MINIO_ENDPOINT}"
                         - name: AWS_ENDPOINT_URL_S3
                           value: "${MINIO_ENDPOINT}"
                         - name: AWS_DEFAULT_REGION
                           value: "${AWS_DEFAULT_REGION}"
-                        - name: MLFLOW_TRACKING_URI
-                          value: "${MLFLOW_TRACKING_URI}"
-                        - name: AWS_ACCESS_KEY_ID
-                          valueFrom:
-                            secretKeyRef:
-                              name: smartshop-credentials
-                              key: AWS_ACCESS_KEY_ID
-                        - name: AWS_SECRET_ACCESS_KEY
-                          valueFrom:
-                            secretKeyRef:
-                              name: smartshop-credentials
-                              key: AWS_SECRET_ACCESS_KEY
+                        - name: NCCL_DEBUG
+                          value: "INFO"
+                        - name: NCCL_IB_DISABLE
+                          value: "1"
+                      resources:
+                        requests:
+                          nvidia.com/gpu: "${LLM_GPUS_PER_NODE}"
                       volumeMounts:
                         - name: shm
                           mountPath: /dev/shm
@@ -78,7 +125,7 @@ spec:
                     - name: shm
                       emptyDir:
                         medium: Memory
-                        sizeLimit: "8Gi"
+                        sizeLimit: "32Gi"
 
 ---
 # Kubeflow Trainer - LLM Fine-Tuning (FSDP on Slurm)
@@ -115,60 +162,3 @@ spec:
         cpu: "32"
         memory: "128Gi"
         nvidia.com/gpu: "${LLM_GPUS_PER_NODE}"
-
----
-# ClusterTrainingRuntime for FSDP LLM training dispatched to Slurm
-apiVersion: trainer.kubeflow.org/v1alpha1
-kind: ClusterTrainingRuntime
-metadata:
-  name: smartshop-llm-fsdp-slurm
-spec:
-  template:
-    spec:
-      replicatedJobs:
-        - name: worker
-          template:
-            spec:
-              template:
-                spec:
-                  containers:
-                    - name: trainer
-                      env:
-                        - name: HF_TOKEN
-                          valueFrom:
-                            secretKeyRef:
-                              name: hf-credentials
-                              key: token
-                        - name: HF_HOME
-                          value: "${HF_HOME}"
-                        - name: S3_ENDPOINT
-                          value: "${MINIO_ENDPOINT}"
-                        - name: AWS_ENDPOINT_URL_S3
-                          value: "${MINIO_ENDPOINT}"
-                        - name: AWS_DEFAULT_REGION
-                          value: "${AWS_DEFAULT_REGION}"
-                        - name: MLFLOW_TRACKING_URI
-                          value: "${MLFLOW_TRACKING_URI}"
-                        - name: NCCL_DEBUG
-                          value: "INFO"
-                        - name: AWS_ACCESS_KEY_ID
-                          valueFrom:
-                            secretKeyRef:
-                              name: smartshop-credentials
-                              key: AWS_ACCESS_KEY_ID
-                        - name: AWS_SECRET_ACCESS_KEY
-                          valueFrom:
-                            secretKeyRef:
-                              name: smartshop-credentials
-                              key: AWS_SECRET_ACCESS_KEY
-                      volumeMounts:
-                        - name: shm
-                          mountPath: /dev/shm
-                      resources:
-                        requests:
-                          nvidia.com/gpu: "${LLM_GPUS_PER_NODE}"
-                  volumes:
-                    - name: shm
-                      emptyDir:
-                        medium: Memory
-                        sizeLimit: "32Gi"

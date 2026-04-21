@@ -57,7 +57,8 @@ def compute_user_features(reviews_df):
         .withColumn("user_category_count", F.size("user_categories"))
         .withColumn(
             "user_tenure_days",
-            F.datediff("user_last_active", "user_first_active"),
+            # timestamp is Unix ms epoch (BIGINT) → convert diff to days
+            ((F.col("user_last_active") - F.col("user_first_active")) / 86_400_000).cast("int"),
         )
         .drop("user_categories")
         .withColumn("event_timestamp", F.current_timestamp())
@@ -156,7 +157,9 @@ def main():
 
     print(f"Reading reviews from {args.input}")
     read_start = time.time()
-    reviews_df = spark.read.parquet(args.input)
+    # Support comma-separated paths for multi-directory reads (non-Hive-partitioned shards)
+    input_paths = [p.strip() for p in args.input.split(",") if p.strip()]
+    reviews_df = spark.read.parquet(*input_paths)
 
     # Normalize column names
     if "asin" in reviews_df.columns and "parent_asin" not in reviews_df.columns:

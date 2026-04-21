@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: upload-rapids-cuda13
+  namespace: smartshop
+spec:
+  ttlSecondsAfterFinished: 1800
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: uploader
+          image: quay.io/abdhumal/smartshop-spark-jobs:latest
+          command: ["python3.12", "-c"]
+          args:
+            - |
+              import requests, s3fs, os
+              print("Downloading rapids-4-spark_2.12-26.02.2-cuda13.jar (~493MB) ...", flush=True)
+              fs = s3fs.S3FileSystem(
+                  key=os.environ["AWS_ACCESS_KEY_ID"],
+                  secret=os.environ["AWS_SECRET_ACCESS_KEY"],
+                  endpoint_url="http://minio.smartshop.svc.cluster.local:9000",
+                  use_ssl=False)
+              
+              url = "https://repo1.maven.org/maven2/com/nvidia/rapids-4-spark_2.12/26.02.2/rapids-4-spark_2.12-26.02.2-cuda13.jar"
+              s3path = "smartshop-raw/jars/rapids-4-spark-cuda13.jar"
+              
+              resp = requests.get(url, stream=True, timeout=600)
+              resp.raise_for_status()
+              total = int(resp.headers.get("content-length", 0))
+              downloaded = 0
+              with fs.open(s3path, "wb") as out:
+                  for chunk in resp.iter_content(chunk_size=8*1024*1024):
+                      out.write(chunk)
+                      downloaded += len(chunk)
+                      if downloaded % (50*1024*1024) < 8*1024*1024:
+                          print(f"  {downloaded/1e6:.0f}/{total/1e6:.0f} MB", flush=True)
+              print(f"Done: {downloaded/1e6:.0f} MB uploaded", flush=True)
+          envFrom:
+            - secretRef:
+                name: smartshop-credentials
+          resources:
+            requests: {cpu: "1", memory: 1Gi}
+            limits: {cpu: "2", memory: 4Gi}
