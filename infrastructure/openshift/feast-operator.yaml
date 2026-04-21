@@ -93,6 +93,6 @@ spec:
           restAPI: true
 
     ui:
-      server:
-        # UI also reads feature_store.yaml — needs feast[spark] to parse offline_store.type: spark
-        image: ${FEAST_SERVER_IMAGE}
+      # image is a top-level field under services.ui (not services.ui.server)
+      # UI reads feature_store.yaml — needs feast[spark] to parse offline_store.type: spark
+      image: ${FEAST_SERVER_IMAGE}
