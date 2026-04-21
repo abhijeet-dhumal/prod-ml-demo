@@ -1,22 +1,26 @@
 # SmartShop AI — Setup Guide
 
-**Platform:** Red Hat OpenShift AI (RHOAI) 3.4+
+**Platform:** Red Hat OpenShift AI (RHOAI) 3.4+  
+**Cluster:** `apps.oai-kft-ibm.ibm.rh-ods.com` · **Namespace:** `smartshop`
+
+> This is the complete operator reference for deploying the SmartShop AI demo from scratch.
+> If you are presenting the demo (not deploying it), see [DEMO-SCRIPT.md](DEMO-SCRIPT.md) instead.
 
 ---
 
 ## What This Demo Does
 
-SmartShop AI is a production e-commerce ML platform with three user-facing features:
+SmartShop AI is a production e-commerce ML platform with three end-user features, all served live from a single Gradio UI:
 
-1. **Product recommendations** — two-tower PyTorch model trained on purchase/rating history
-2. **Review summaries** — Mistral-7B fine-tuned with QLoRA to summarise long product reviews
-3. **Product Q&A** — RAG pipeline that answers questions by searching review embeddings
+1. **Product recommendations** — two-tower PyTorch model trained on 140M purchase interactions; features fetched from Redis in < 1 ms
+2. **Review summaries** — Mistral-7B fine-tuned with QLoRA on 104M cleaned reviews; served via vLLM on KServe
+3. **Product Q&A** — RAG pipeline that retrieves semantically similar reviews from Milvus and answers via the same LLM endpoint
+
+The full pipeline — from raw S3 data to live endpoints — runs entirely on OpenShift AI using managed operators and standard Kubernetes manifests. There are no custom scripts that bypass the platform.
 
 ---
 
 ## Pipeline Overview
-
-![SmartShop AI architecture — full pipeline from raw data to serving endpoints](./assets/00-architecture-overview.png)
 
 ```mermaid
 flowchart TD
@@ -154,13 +158,37 @@ KServe InferenceService
 
 ## Prerequisites
 
-- `oc` CLI installed and logged in (`oc login <api-url> --token=<token>`)
-- `helm` v3+ installed
-- `aws` CLI installed (for MinIO bucket creation)
-- `make` installed
-- `jq` installed (for DSC condition checks)
-- `python3` with `pyarrow` installed (for Feast placeholder step)
-- This repo cloned locally: `git clone https://github.com/abhijeet-dhumal/prod-ml-demo.git`
+### Cluster
+
+| Requirement | Minimum | Notes |
+|---|---|---|
+| Red Hat OpenShift AI | 3.4+ | RHOAI operator must be installed via OperatorHub |
+| Spark Operator | RHOAI-managed | Enable via `DataScienceCluster` → `spec.components.datasciencepipelines.managementState: Managed` |
+| Kubeflow Trainer v2 | v2.x | `TrainJob` CRD required |
+| Slurm / Slinky | Slinky Operator 0.9+ | Needed only for the FSDP LLM fine-tuning segment |
+| Feast Operator | RHOAI-managed | Enabled via RHOAI dashboard or DSC |
+| KServe | RHOAI-managed | Serverless mode |
+| GPU nodes | 1 node × 4 GPUs minimum | NVIDIA A100 recommended; RAPIDS requires GPU executor nodes |
+| NFS RWX StorageClass | `nfs-csi` or equivalent | 200Gi shared storage required for MinIO |
+| GPU Operator + DCGM | Latest from OperatorHub | Required for Prometheus GPU metrics |
+
+### Local tools
+
+```bash
+oc      # OpenShift CLI — oc login before running any make target
+helm    # v3+ for Milvus and Slurm helm installs
+aws     # AWS CLI configured to point at MinIO (used for bucket operations)
+make    # GNU make
+jq      # used by apply-all.sh for DSC condition checks
+python3 # with pyarrow (pip install pyarrow) for the Feast schema step
+```
+
+### Clone the repo
+
+```bash
+git clone https://github.com/abhijeet-dhumal/prod-ml-demo.git
+cd prod-ml-demo
+```
 
 ---
 
@@ -1268,23 +1296,18 @@ oc get inferenceservice -n smartshop -w
 
 ---
 
-## Pending / Outstanding Work
+## Pipeline Dependencies
 
-| Item | Status | Notes |
-|---|---|---|
-| Secrets management | **Done ✅** | `.env` → `make setup-secrets` creates all K8s secrets across both namespaces |
-| MinIO (NFS-backed) | **Done ✅** | Deployed, 5 buckets created, credentials wired |
-| Redis + RedisInsight | **Done ✅** | Running, NFS PVC, password-auth confirmed |
-| Milvus + Attu | **Done ✅** | Standalone mode, NFS-backed, S3 backend for segments |
-| Feast Feature Store | **Done ✅** | `feast apply` ran, 3 feature views registered, visible in RHOAI dashboard |
-| MLflow | **Done ✅** | PostgreSQL backend (ClusterIP workaround for OVN-K), MinIO S3 artifacts, dashboard accessible |
-| Slurm (Slinky) | **Done ✅** | Operator installed, cluster deployed, controller + login + restapi running |
-| Spark Operator | **Done ✅** | Enabled via DSC `managementState: Managed`, RBAC applied to `smartshop` |
-| Container images | **Done ✅** | All 5 images built via OpenShift BuildConfig and pushed to `quay.io/abdhumal` |
-| Amazon Reviews dataset download | **Next ▶️** | Run `make data-full` (49GB), upload to `s3://smartshop-raw/raw/` |
-| Spark ETL job | **Pending** | Blocked on data upload. Run `envsubst < infrastructure/openshift/spark-application.yaml \| oc apply -f -` |
-| Feast materialize | **Pending** | Blocked on Spark ETL. Pushes features from MinIO → Redis + Milvus |
-| Recommendation model training | **Pending** | Blocked on Feast materialize. `make train-rec-k8s` — 1 node × 4 GPUs DDP |
-| LLM fine-tuning | **Pending** | Blocked on Feast materialize. Slurm FSDP job — 2 nodes × 4 GPUs |
-| KServe InferenceServices | **Pending** | Blocked on trained models. `make serve-k8s` |
-| Gradio demo UI | **Pending** | `demo/app.py` exists — needs `RECOMMEND_URL`, `SUMMARIZE_URL`, `RAG_URL` env vars pointing to KServe routes |
+Each phase depends on the previous. This table shows what each phase produces and what the next phase consumes, so you know exactly when it is safe to proceed.
+
+| Phase | Command | Produces | Required by |
+|---|---|---|---|
+| 0 — Credentials | `make setup-secrets` | Kubernetes Secrets in `smartshop` + `redhat-ods-applications` | Everything |
+| 1 — Infra | `make deploy` | MinIO buckets, Redis, PostgreSQL, Milvus, MLflow, Feast pod | Phases 3–6 |
+| 2 — Images | `make build-images` | Container images pushed to `quay.io` | Phases 3–6 |
+| 3 — Dataset | `make data-full` | Raw JSON in `s3://smartshop-raw/` | Phase 4 Spark ETL |
+| 4 — Spark ETL | `make spark-run` | Parquet features in `s3://smartshop-features/` and `s3://smartshop-embeddings/` | Phase 5 Feast + Training |
+| 5 — Feast | `make feast-apply && make feast-materialize` | Features in Redis online store; embeddings in Milvus | Phase 6 Training + Serving |
+| 6 — Training | `make train-rec-k8s && make train-llm-slurm` | Model artifacts in `s3://smartshop-models/` + MLflow runs | Phase 7 Serving |
+| 7 — Serving | `make serve-k8s` | Three KServe InferenceService endpoints | Phase 8 Demo UI |
+| 8 — Demo UI | `make demo` | Live Gradio UI at the cluster route | — |

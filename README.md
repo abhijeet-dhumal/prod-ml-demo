@@ -1,20 +1,36 @@
 # SmartShop AI: Production ML at Scale
 
-Reference implementation for the Red Hat Summit 2026 presentation on production ML at scale.
+> **Red Hat Summit 2026** — reference implementation for distributed ML on Red Hat OpenShift AI.
 
-Demonstrates **PyTorch Distributed**, **Kubeflow Trainer**, **Apache Spark** (+ RAPIDS GPU acceleration), **Feast Feature Store**, **Slurm**, and **MLflow** on **Red Hat OpenShift AI** through a realistic e-commerce use case.
+This repository is a **fully deployable, end-to-end ML platform** for an e-commerce use case. It is designed for ML platform engineers and data scientists who want to see exactly how production-grade distributed training, feature engineering, and model serving fit together on OpenShift AI — with real infrastructure manifests, real data, and real performance numbers.
+
+**Technologies demonstrated:** PyTorch Distributed (DDP + FSDP), Kubeflow Trainer v2, Apache Spark + RAPIDS GPU acceleration, Feast Feature Store, Slurm/Slinky, MLflow, RHOAI Model Registry, KServe.
+
+---
+
+## Who This Is For
+
+| Audience | What you get from this repo |
+|---|---|
+| **ML Platform Engineers** | Fully working OpenShift manifests for every component — copy, adapt, deploy |
+| **Data Scientists** | End-to-end pipeline from raw S3 data to live inference endpoints via Feast + MLflow |
+| **OpenShift Admins** | Namespace, RBAC, BuildConfig, and operator configuration reference |
+| **Demo Presenters** | See [docs/DEMO-SCRIPT.md](docs/DEMO-SCRIPT.md) for the guided live demo narrative |
+
+---
 
 ## What It Does
 
-SmartShop AI is a production e-commerce platform that:
+SmartShop AI is a production e-commerce ML platform that:
 
-1. **Recommends products** using a PyTorch two-tower model trained on purchase/rating history (DDP on K8s)
-2. **Summarizes reviews** using a fine-tuned Mistral-7B (QLoRA + FSDP on Slurm)
-3. **Answers product questions** via RAG over review embeddings stored in Feast's vector store
+1. **Recommends products** using a PyTorch two-tower model trained on 140M purchase interactions (DDP on K8s, 4× A100 GPUs)
+2. **Summarizes reviews** using Mistral-7B fine-tuned with QLoRA + FSDP across 2 nodes via Slurm
+3. **Answers product questions** via RAG over 104M review embeddings stored in Feast's vector store
 
 ## Architecture
 
-See [docs/SETUP.md](docs/SETUP.md) for the full setup guide, component rationale, and storage layout.
+See [docs/SETUP.md](docs/SETUP.md) for the full setup guide, component rationale, and storage layout.  
+See [docs/DEMO-SCRIPT.md](docs/DEMO-SCRIPT.md) for the step-by-step guided demo narrative.
 
 ```mermaid
 flowchart TD
@@ -140,7 +156,27 @@ GPU nodes are expensive. Slurm worker pods (`NodeSet`) are scaled to 0 when not 
 
 ---
 
+## Hardware Prerequisites
+
+This demo is designed for Red Hat OpenShift AI on a GPU-enabled cluster. A minimal working configuration:
+
+| Resource | Minimum | Used in this demo |
+|---|---|---|
+| GPU nodes | 1 node × 4 GPUs | 2 nodes × 8 GPUs (A100-SXM4-80GB) |
+| GPU driver | CUDA 12+ | CUDA 13 / driver 580.x |
+| Shared storage | NFS RWX StorageClass | `nfs-csi`, 200Gi |
+| RHOAI version | 3.4+ | 3.4 |
+| Operators required | Spark, Kubeflow Trainer v2, Slurm/Slinky, Feast, KServe | all via OperatorHub |
+
+> The RAPIDS GPU path (`spark-application-rapids.yaml`) requires GPU executor nodes. All other
+> pipeline stages run on CPU nodes. If you have no GPU nodes, skip `make spark-features-rapids`
+> and `make train-llm-slurm`.
+
+---
+
 ## Quick Start (Local / Sample Data)
+
+Use this path to validate the pipeline end-to-end on a laptop with ~1M reviews before committing to a full cluster deployment.
 
 ```bash
 # 1. Install all dev dependencies
@@ -153,13 +189,14 @@ cp .env.example .env  # edit .env before continuing
 make data-sample
 
 # 4. Run Spark preprocessing locally
-make spark-local
+make spark-local      # writes Parquet features to local MinIO
 
-# 5. Set up Feast feature store
-make feast-apply
+# 5. Register and materialize Feast features
+make feast-apply      # registers feature views + entities
+make feast-materialize  # pushes features from Parquet → Redis online store
 
 # 6. Train recommendation model
-make train-rec
+make train-rec        # single-process, ~5 min on CPU
 
 # 7. (Optional) Fine-tune LLM on sample data
 make train-llm
@@ -168,44 +205,52 @@ make train-llm
 make serve
 
 # 9. Launch demo UI
-make demo
+make demo             # opens http://localhost:7860
 ```
+
+---
 
 ## Full-Scale Run (OpenShift AI)
 
+This is the path used for the Summit demo. All jobs run as Kubernetes workloads on the cluster.
+
 ```bash
-# 0. Prerequisites: oc login, .env filled in
-cp .env.example .env   # set cluster domain, credentials, HF_TOKEN, etc.
-make setup-secrets     # creates all Kubernetes secrets from .env
+# 0. Prerequisites — complete before any other step
+cp .env.example .env       # fill in cluster domain, credentials, HF_TOKEN, QUAY_USER, etc.
+make setup-secrets         # creates all Kubernetes secrets from .env (idempotent)
 
-# 1. Deploy core namespace resources (storage, RBAC)
-make deploy
+# 1. Deploy core namespace resources (storage, RBAC, infra services)
+make deploy                # namespace, MinIO, Redis, PostgreSQL, Milvus, MLflow, Feast
 
-# 2. Build container images on-cluster via BuildConfig + ImageStream
-make setup-builds      # create ImageStreams + BuildConfigs (once per cluster)
-make build-images      # trigger oc start-build for all 4 images
+# 2. Build container images on-cluster
+make setup-builds          # create ImageStreams + BuildConfigs (once per cluster)
+make build-images          # trigger oc start-build for all images; pushes to quay.io
 
-# 3. Download full dataset (~49GB) and upload to MinIO smartshop-raw/
-make data-full
+# 3. Download full dataset (~49GB) and stage to MinIO
+make data-full             # streams HuggingFace → MinIO smartshop-raw/ (runs as a K8s Job)
 
-# 4. Submit Spark ETL jobs to cluster
-make spark-run              # CPU path: feature_engineering + text_preprocessing + embedding_generation
-make spark-features-rapids  # GPU path via RAPIDS (optional, requires GPU executor nodes)
+# 4. Run Spark ETL — feature engineering, text prep, embeddings
+make spark-run             # submits all 3 SparkApplications (CPU path)
+make spark-features-rapids # GPU path via RAPIDS (optional — same output, ~1.3× faster on A100s)
+# Monitor: oc get sparkapplication -n smartshop
 
-# 5. Register Feast feature views and materialize to online store
-make feast-apply
-make feast-materialize
+# 5. Register Feast schema and materialize features to online store
+make feast-apply           # registers feature views, entities, data sources
+make feast-materialize     # pushes Parquet features → Redis + Milvus
 
 # 6. Submit distributed training jobs
-make train-rec-k8s     # Two-Tower rec model — DDP on K8s (Kubeflow TrainJob)
-make train-llm-slurm   # Mistral-7B QLoRA — FSDP on Slurm
+make train-rec-k8s         # Two-Tower recommendation model — PyTorch DDP, Kubeflow TrainJob
+make train-llm-slurm       # Mistral-7B QLoRA fine-tuning — FSDP, 2 nodes via Slurm
 
 # 7. Deploy all 3 KServe InferenceServices
-make serve-k8s
+make serve-k8s             # recommendation + review summary + RAG Q&A endpoints
 
-# 8. Launch demo UI
-make demo
+# 8. Launch Gradio demo UI
+make demo                  # opens the demo UI, calls all 3 endpoints
 ```
+
+For a complete walkthrough of every step including operator setup, see [docs/SETUP.md](docs/SETUP.md).  
+For the guided live demo narrative, see [docs/DEMO-SCRIPT.md](docs/DEMO-SCRIPT.md).
 
 ## Project Structure
 
