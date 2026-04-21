@@ -29,8 +29,12 @@ data:
 ---
 # feast-spark-config Secret
 # Referenced by spec.services.offlineStore.persistence.store.secretRef.
-# Key name defaults to the offline store type: "spark".
+# Key name must match the offline store type: "spark".
 # Content is merged into feature_store.yaml under offline_store (excluding type).
+#
+# spark.master: local[*] — SparkSession runs in-process inside the feast pod.
+# EnvironmentVariableCredentialsProvider reads AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
+# from the feast-s3-credentials envFrom (already mounted on all feast containers).
 apiVersion: v1
 kind: Secret
 metadata:
@@ -41,9 +45,11 @@ stringData:
     spark_conf:
       spark.master: "local[*]"
       spark.ui.enabled: "false"
+      spark.eventLog.enabled: "false"
       spark.sql.session.timeZone: "UTC"
       spark.sql.execution.arrow.pyspark.enabled: "true"
       spark.sql.execution.arrow.fallback.enabled: "true"
+      spark.sql.shuffle.partitions: "8"
       spark.hadoop.fs.s3a.endpoint: "http://minio.${NAMESPACE}.svc.cluster.local:9000"
       spark.hadoop.fs.s3a.path.style.access: "true"
       spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"

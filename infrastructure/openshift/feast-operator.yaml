@@ -24,6 +24,18 @@ metadata:
 spec:
   feastProject: smartshop
 
+  # Git repo where feast/feature_repo lives.
+  # Init containers clone this repo to /feast-data/smartshop/feature_repo/
+  # and run `feast apply` before the main containers start.
+  # Since all service images are overridden to feast-spark-server (which has pyspark),
+  # the init container can also import SparkSource and run `feast apply` against
+  # the live Parquet files in MinIO.
+  feastProjectDir:
+    git:
+      url: https://github.com/abhijeet-dhumal/prod-ml-demo.git
+      ref: ${GIT_BRANCH}
+      featureRepoPath: feast/feature_repo
+
   # batchEngine: injects batch_engine: {type: spark.engine, spark_conf: {...}}
   # into feature_store.yaml via the feast-spark-engine ConfigMap.
   batchEngine:
@@ -31,10 +43,6 @@ spec:
       name: feast-spark-engine
 
   services:
-    # Disable init containers — feast apply runs manually after pod starts
-    # (default feast[minimal] image in init containers lacks pyspark / SparkSource)
-    disableInitContainers: true
-
     offlineStore:
       persistence:
         store:
