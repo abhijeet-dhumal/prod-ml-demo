@@ -1,30 +1,56 @@
-# Local development config.
-# In-cluster, the Feast operator CR (feast-operator.yaml) overrides these backends.
+# SmartShop feature_store.yaml
 #
-# For local `feast apply` / `feast materialize` against the dev cluster:
-#   export AWS_ENDPOINT_URL_S3=https://minio-s3-smartshop.apps.<cluster-domain>
-#   export AWS_ACCESS_KEY_ID=<key>
-#   export AWS_SECRET_ACCESS_KEY=<secret>
-#   export REDIS_HOST=<port-forward-host>
-#   export REDIS_PORT=6379
-#   export REDIS_PASSWORD=<password>
-#   export PG_USER=<user>  PG_PASSWORD=<password>  PG_HOST=localhost  PG_DATABASE=mlflow
+# This file is used in two contexts:
+#
+#   1. feast-spark-server pod (materialization):
+#        - offline_store.type: spark  →  SparkComputeEngine reads SparkSource → Redis
+#        - registry: file on PVC (/feast-registry/registry.db)
+#        - Set by: FeatureStore CR batchEngine ConfigMap + offlineStore secret
+#
+#   2. rec-trainer pod (training - get_historical_features):
+#        - offline_store.type: spark  →  SparkSession local[*] in training pod
+#        - registry: remote gRPC → feast-smartshop-feast-registry svc
+#        - Set by: FEAST_REGISTRY_TYPE=remote + FEAST_REGISTRY_PATH env vars
+#
+# Env vars used: AWS_ENDPOINT_URL_S3, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+#                REDIS_HOST, REDIS_PORT, REDIS_PASSWORD,
+#                FEAST_REGISTRY_TYPE (file|remote), FEAST_REGISTRY_PATH
+#
+# For local dev: export the above from .env, then: feast apply / feast materialize-incremental
+
 project: smartshop
 provider: local
 
-# SQL registry — matches in-cluster FeatureStore CR (file registry.db blocks concurrent writes).
+# Registry switches between file (feast server) and remote gRPC (training pod)
+# via env vars. Defaults to file-backed PVC path used by the feast server pod.
 registry:
-  registry_type: sql
-  path: "postgresql+psycopg2://${PG_USER}:${PG_PASSWORD}@${PG_HOST:-localhost}:5432/${PG_DATABASE:-mlflow}"
-  cache_mode: thread
-  cache_ttl_seconds: 60
+  registry_type: ${FEAST_REGISTRY_TYPE:-file}
+  path: ${FEAST_REGISTRY_PATH:-/feast-registry/registry.db}
 
-# dask offline store (file-based) — matches in-cluster FeatureStore CR.
 offline_store:
-  type: file
+  type: spark
+  spark_conf:
+    spark.master: "local[*]"
+    spark.ui.enabled: "false"
+    spark.eventLog.enabled: "false"
+    spark.sql.catalogImplementation: "hive"
+    spark.sql.session.timeZone: "UTC"
+    spark.sql.execution.arrow.pyspark.enabled: "true"
+    spark.sql.execution.arrow.fallback.enabled: "true"
+    spark.sql.shuffle.partitions: "8"
+    # s3a MinIO access — credentials from EnvironmentVariableCredentialsProvider
+    # (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY from feast-s3-credentials secret)
+    spark.hadoop.fs.s3a.endpoint: "${AWS_ENDPOINT_URL_S3:-http://minio.smartshop.svc.cluster.local:9000}"
+    spark.hadoop.fs.s3a.path.style.access: "true"
+    spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+    spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+  # staging_location: write large materializations to S3 staging before Redis write
+  # auto-converts s3:// → s3a:// internally
+  staging_location: "s3://smartshop-features/feast-staging/"
 
 online_store:
   type: redis
-  connection_string: "${REDIS_HOST:-localhost}:${REDIS_PORT:-6379},password=${REDIS_PASSWORD}"
+  connection_string: "${REDIS_HOST:-redis.smartshop.svc.cluster.local}:${REDIS_PORT:-6379},password=${REDIS_PASSWORD}"
 
 entity_key_serialization_version: 3

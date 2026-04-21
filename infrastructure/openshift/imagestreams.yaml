@@ -43,3 +43,14 @@ metadata:
 spec:
   lookupPolicy:
     local: true
+---
+# feast-spark-server: feature-server:0.62.0 + pyspark==4.0.0 + hadoop-aws JARs
+# Used by FeatureStore CR for SparkOfflineStore + SparkComputeEngine
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: feast-spark-server
+  namespace: ${NAMESPACE}
+spec:
+  lookupPolicy:
+    local: true

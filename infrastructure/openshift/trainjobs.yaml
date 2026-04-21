@@ -25,6 +25,12 @@ spec:
                       env:
                         - name: FEAST_REPO_PATH
                           value: "${FEAST_REPO_PATH}"
+                        # Feast remote registry — training pod reads feature defs from
+                        # feast server gRPC rather than direct PVC access
+                        - name: FEAST_REGISTRY_TYPE
+                          value: "${FEAST_REGISTRY_TYPE:-remote}"
+                        - name: FEAST_REGISTRY_PATH
+                          value: "${FEAST_REGISTRY_PATH:-feast-smartshop-feast-registry.smartshop.svc.cluster.local:6570}"
                         - name: S3_ENDPOINT
                           value: "${MINIO_ENDPOINT}"
                         - name: AWS_ENDPOINT_URL_S3

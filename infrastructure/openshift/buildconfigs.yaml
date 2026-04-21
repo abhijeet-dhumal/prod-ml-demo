@@ -133,6 +133,39 @@ spec:
   failedBuildsHistoryLimit: 2
 
 ---
+# BuildConfig — feast-spark-server
+# Extends feature-server:0.62.0 with pyspark==4.0.0 + hadoop-aws JARs.
+# Output: internal ImageStream (no Quay push needed — used within the namespace).
+# Trigger: oc start-build feast-spark-server -n ${NAMESPACE}
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: feast-spark-server
+  namespace: ${NAMESPACE}
+spec:
+  source:
+    type: Git
+    git:
+      uri: ${GIT_REPO}
+      ref: ${GIT_BRANCH}
+    contextDir: "."
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: build/Containerfile.feast-spark
+      noCache: false
+  output:
+    to:
+      kind: ImageStreamTag
+      name: feast-spark-server:latest
+  resources:
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  successfulBuildsHistoryLimit: 2
+  failedBuildsHistoryLimit: 2
+
+---
 # BuildConfig — rec-server (serving image)
 apiVersion: build.openshift.io/v1
 kind: BuildConfig

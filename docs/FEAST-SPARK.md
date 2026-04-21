@@ -424,21 +424,180 @@ For OpenShift / on-prem, the recommended stack is explicitly:
 
 ---
 
-## Execution Order for Phase 4 Upgrade
+## Execution Order (all phases)
 
 ```
-1. Build feast-spark-server image (BuildConfig)    ~10 min
-2. Update features.py (FileSource → SparkSource)   local
-3. Update feature_store.yaml                        local
-4. Create feast-spark-engine ConfigMap              oc apply
-5. Create feast-spark-config Secret                 oc apply
-6. Update FeatureStore CR (offlineStore + batchEngine + image)  oc apply
-7. Wait for feast pod restart + ready               ~2 min
-8. feast apply (re-register SparkSource views)      oc exec
-9. feast materialize-incremental                    oc exec / cron
+Phase 4 — Materialization
+  1. Apply ImageStream + BuildConfig                   oc apply
+  2. oc start-build feast-spark-server --follow        ~10 min
+     (builds: feature-server:0.62.0 + pyspark==4.0.0 + hadoop-aws JARs)
+  3. Apply feast-spark-engine ConfigMap + Secret       oc apply
+  4. Apply FeatureStore CR                             oc apply (triggers pod restart)
+  5. Wait for feast pod ready + pyspark check          oc exec -c offline -- python3 -c ...
+  6. feast apply  (register SparkSource views)         oc exec
+  7. feast materialize-incremental                     oc exec / scheduled
+
+Phase 5 — Training (rec model)
+  8. Rebuild rec-trainer image (now includes pyspark+feast)  oc start-build rec-trainer
+  9. Set FEAST_REGISTRY_TYPE=remote + FEAST_REGISTRY_PATH in .env
+  10. envsubst < trainjobs.yaml | oc apply -f -
+  11. Watch rank-0 logs: [Feast] retrieved N rows in Xs (SparkOfflineStore join)
+  12. DDP training completes → model to MinIO
+
+Phase 6 — Serving
+  13. KServe calls feast.get_online_features() → Redis (same feature defs)
 ```
 
-Steps 2–6 can be done while the image builds. Step 7+ require the build to complete.
+Steps 3–7 (code changes) are already complete in the repo. Only `oc` commands remain.
+
+---
+
+## Complete E2E Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Phase 3 — Spark ETL (RHOAI Spark Operator)           │
+│                                                                          │
+│   SparkApplication: spark-application-rapids.yaml                       │
+│   Image: smartshop-spark-jobs-rapids (PySpark 3.5 + RAPIDS GPU)        │
+│   Driver/executors run as OpenShift pods (external SparkApplication)    │
+│                                                                          │
+│   Reads:  s3a://smartshop-raw/raw/reviews/{Category}.parquet            │
+│   Writes: s3a://smartshop-features/user_features/*.parquet              │
+│           s3a://smartshop-features/item_features/*.parquet              │
+│           s3a://smartshop-features/interactions/*.parquet               │
+│           s3a://smartshop-text/llm_data/*.parquet                       │
+└───────────────────────────┬─────────────────────────────────────────────┘
+                            │  Parquet files on MinIO (s3a://)
+          ┌─────────────────┼─────────────────────┐
+          ▼                 ▼                      ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────────────────┐
+│ Phase 4          │ │ Phase 5          │ │ Phase 6                       │
+│ Feast Server Pod │ │ rec-trainer Pod  │ │ KServe InferenceService       │
+│ (feast-spark-    │ │ (TrainJob DDP)   │ │                               │
+│  server image)   │ │                  │ │                               │
+│                  │ │ feast.           │ │ GET /recommend?user_id=U123   │
+│ SparkCompute     │ │ get_historical   │ │         │                     │
+│ Engine local[*]  │ │ _features()      │ │         ▼                     │
+│         │        │ │ SparkOffline     │ │ feast.get_online_features()   │
+│         │        │ │ Store local[*]   │ │         │                     │
+│         ▼        │ │         │        │ │         ▼                     │
+│      Redis       │ │         ▼        │ │       Redis                   │
+│   online store   │ │ training_df      │ │   <1ms feature lookup         │
+│                  │ │ → TwoTower model │ │         │                     │
+└──────────────────┘ └──────────────────┘ │         ▼                     │
+                                          │ Model inference → response    │
+                                          └──────────────────────────────┘
+```
+
+### Feast Registry — two access patterns
+
+| Context | Registry type | Path |
+|---------|--------------|------|
+| **feast server pod** (materialize) | `file` | `/feast-registry/registry.db` (PVC) |
+| **rec-trainer pod** (training) | `remote` | `feast-smartshop-feast-registry.smartshop.svc.cluster.local:6570` |
+
+The training pod reads feature definitions via remote gRPC → feast registry server. It executes the actual Spark join **locally** (pyspark `local[*]` in the training container) against MinIO — no round-trip through the feast server for data.
+
+Controlled by env vars in `feature_store.yaml`:
+```yaml
+registry:
+  registry_type: ${FEAST_REGISTRY_TYPE:-file}
+  path: ${FEAST_REGISTRY_PATH:-/feast-registry/registry.db}
+```
+
+In TrainJob: `FEAST_REGISTRY_TYPE=remote`, `FEAST_REGISTRY_PATH=feast-smartshop-feast-registry.smartshop.svc.cluster.local:6570`
+
+---
+
+## Training: `feast.get_historical_features()` with SparkOfflineStore
+
+### Why use it (vs direct `pd.read_parquet`)
+
+| Aspect | Direct `pd.read_parquet` (old) | `get_historical_features()` (new) |
+|--------|-------------------------------|-----------------------------------|
+| Point-in-time correctness | ❌ uses all data | ✅ joins as-of `event_timestamp` |
+| Training-serving skew | ❌ feature defs can diverge | ✅ same SparkSource as serving |
+| Data leakage | ⚠️ future features in past labels | ✅ prevented by temporal join |
+| Scale | ❌ Pandas OOM >10M rows | ✅ Spark distributed join |
+| Feature lineage | ❌ invisible to Feast registry | ✅ tracked in Feast UI |
+
+### Implementation in `train.py`
+
+```python
+# train.py — rank-0 loads via Feast, saves to /tmp, all ranks read /tmp
+if rank == 0:
+    if use_feast:
+        # 1. Load interactions (entity_df with event_timestamps)
+        interactions_df = pd.read_parquet(f"{args.data_dir}/interactions", ...)
+
+        # 2. Point-in-time correct join via SparkOfflineStore
+        store = FeatureStore(repo_path=feast_repo_path)
+        entity_df = interactions_df[["user_id", "item_id", "event_timestamp"]]
+        entity_df["event_timestamp"] = pd.to_datetime(
+            entity_df["event_timestamp"], unit="ms", utc=True
+        )
+        training_df = store.get_historical_features(
+            entity_df=entity_df,
+            features=[
+                "user_features:user_avg_rating",
+                "user_features:user_review_count",
+                # ... 4 more user features
+                "item_features:item_avg_rating",
+                # ... 5 more item features
+            ],
+        ).to_df()
+        training_df.to_parquet("/tmp/smartshop_training_data.parquet")
+
+if world_size > 1:
+    dist.barrier()  # rank-0 must finish before others read /tmp
+
+df = pd.read_parquet("/tmp/smartshop_training_data.parquet")
+dataset = RecommendationDataset(df)
+```
+
+### What happens inside `get_historical_features()` with SparkOfflineStore
+
+```python
+# sdk/python/feast/infra/offline_stores/contrib/spark_offline_store/spark.py
+SparkOfflineStore.get_historical_features(entity_df, feature_refs):
+  1. SparkSession starts in training pod (local[*])
+  2. entity_df → Spark DataFrame (temp view)
+  3. For each feature_ref:
+       SparkSource.path = "s3a://smartshop-features/user_features/"
+       spark.read.format("parquet").load("s3a://...") via hadoop-aws
+  4. Point-in-time correct JOIN:
+       SELECT * FROM features
+       WHERE features.event_timestamp <= entity.event_timestamp
+         AND features.event_timestamp > entity.event_timestamp - ttl
+       ORDER BY features.event_timestamp DESC
+       (latest feature before each entity row's timestamp)
+  5. Returns SparkRetrievalJob → .to_df() → pandas DataFrame
+```
+
+### Training pod requirements
+
+`build/requirements/training.txt` includes:
+```
+pyspark==4.0.0
+feast==0.62.0
+```
+
+`build/Containerfile.rec-trainer` uses `training.txt` — the same pyspark + hadoop-aws JARs installed. Both feast-spark-server and rec-trainer images share the Spark + S3A stack.
+
+### `--use-feast` vs `--no-feast` flag
+
+`train.py` auto-detects: if `FEAST_REPO_PATH` env var is set, `--use-feast` is the default.
+
+```bash
+# Use Feast (default when FEAST_REPO_PATH set):
+torchrun ... train.py --use-feast
+
+# Legacy direct Parquet (skip Feast, faster startup):
+torchrun ... train.py --no-feast
+```
+
+The TrainJob sets `FEAST_REPO_PATH=${FEAST_REPO_PATH}` in the env. If the env var is set in `.env`, Feast mode activates automatically.
 
 ---
 
@@ -446,5 +605,5 @@ Steps 2–6 can be done while the image builds. Step 7+ require the build to com
 
 - All ETL `SparkApplication` YAML manifests (`spark-application-rapids.yaml`, `spark-application-cpu-baseline.yaml`, `spark-application-text-preprocessing.yaml`, `spark-application-embedding.yaml`) remain **exactly as-is**. Spark ETL is independent of Feast's internal SparkSession.
 - The Redis online store, PostgreSQL registry, MinIO bucket layout — all unchanged.
-- Model training jobs (`trainjobs.yaml`) — unchanged. They read features via `feast.get_online_features()` from Redis, not from the offline store.
-- `collect-run-metrics.sh`, `wait-and-materialize.sh` — largely unchanged; only the `feast materialize-incremental` step now benefits from SparkComputeEngine internally.
+- `collect-run-metrics.sh` — unchanged. `wait-and-materialize.sh` — the `feast materialize-incremental` call now goes through SparkComputeEngine internally (no script change needed).
+- KServe InferenceServices — unchanged. They call `feast.get_online_features()` which reads from Redis.

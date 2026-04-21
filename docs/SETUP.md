@@ -544,28 +544,246 @@ After MinIO, Redis, and Milvus are up, all four core pods should be running in `
 
 Feast is installed and managed by the RHOAI Feast Operator (enabled by default in the DSC as `FeastOperatorReady`).
 
-### 8a — Apply Secrets and FeatureStore CR
+### Architecture
 
-`infrastructure/feast/feast-operator.yaml` contains the `feast-s3-credentials` Secret, the `feast-redis-secret` Secret, and the `FeatureStore` CR. The secret fields use `${VAR}` markers — use `envsubst` or `make setup-secrets` (which also creates the Feast secrets):
+SmartShop uses Feast across **three lifecycle stages**:
 
-```bash
-# Ensure .env is filled in, then:
-make setup-secrets
-
-# Apply the FeatureStore CR (non-secret parts are fine to apply directly)
-envsubst < infrastructure/feast/feast-operator.yaml | oc apply -f -
+```
+                    SparkApplication (RHOAI Spark Operator)
+                    ETL: RAPIDS GPU feature engineering
+                              │
+                              ▼
+                    s3a://smartshop-features/
+                    ├── user_features/*.parquet
+                    ├── item_features/*.parquet
+                    └── interactions/*.parquet
+                              │
+              ┌───────────────┼───────────────────┐
+              ▼               ▼                   ▼
+    ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────┐
+    │  feast-spark-   │  │  rec-trainer pod │  │  KServe         │
+    │  server pod     │  │  (TrainJob)      │  │  InferenceService│
+    │                 │  │                  │  │                 │
+    │  SparkCompute   │  │  feast.          │  │  feast.         │
+    │  Engine         │  │  get_historical  │  │  get_online     │
+    │  local[*]       │  │  _features()     │  │  _features()    │
+    │  Parquet → Redis│  │  SparkOffline    │  │  Redis → model  │
+    └─────────────────┘  │  Store local[*]  │  └─────────────────┘
+                         └──────────────────┘
 ```
 
-The CR configures:
-- **Offline store** — `dask` type, reads Parquet from MinIO S3 in-memory (no dedicated PVC)
-- **Online store** — Redis with password auth via `feast-redis-secret`
-- **Registry** — dedicated 1Gi `nfs-csi` PVC auto-created at `/feast-registry`
-- **Feature source** — cloned from `https://github.com/abhijeet-dhumal/prod-ml-demo.git`, branch `refine-cluster-infra-setup`, path `feast/feature_repo` (update `ref:` in `feast-operator.yaml` when merging to `main`)
+| Component | Role |
+|-----------|------|
+| **SparkComputeEngine** | `feast materialize-incremental` reads SparkSource Parquet → writes to Redis. Runs pyspark `local[*]` **inside** the feast server pod. |
+| **SparkOfflineStore** | `feast.get_historical_features()` in training pod. Point-in-time correct join: entity_df × SparkSource Parquet. Runs pyspark `local[*]` inside the rec-trainer pod. |
+| **Redis online store** | Sub-ms feature lookup at inference time via `get_online_features()`. |
+| **Remote registry** | Training pod reads feature definitions from feast registry server via gRPC (`feast-smartshop-feast-registry:6570`) — no separate registry process needed. |
 
-> **NFS double-mount gotcha:** The Feast pod runs registry, offline, and online store servers
+Both the feast server and rec-trainer use the **same `feast-spark-server` image**: `feature-server:0.62.0 + pyspark==4.0.0 + hadoop-aws JARs`.
+
+### 8a — Build feast-spark-server image
+
+The default RHOAI feature server image (`quay.io/feastdev/feature-server:0.62.0`) ships only `feast[minimal]` (no pyspark). Build the custom image:
+
+```bash
+source .env
+
+# Apply ImageStream
+envsubst < infrastructure/openshift/imagestreams.yaml | oc apply -f -
+
+# Apply BuildConfig
+envsubst < infrastructure/openshift/buildconfigs.yaml | oc apply -f -
+
+# Start build (~5-10 min: pip install pyspark==4.0.0 + 2 JAR downloads ~150MB total)
+oc start-build feast-spark-server -n smartshop --follow
+```
+
+Verify:
+```bash
+oc get build -n smartshop | grep feast-spark
+# feast-spark-server-1   Docker   Git@<sha>   Complete
+```
+
+### 8b — Apply Spark engine ConfigMap + Secret
+
+```bash
+source .env
+envsubst < infrastructure/openshift/feast-spark-engine.yaml | oc apply -f -
+```
+
+- `feast-spark-engine` ConfigMap — batch engine config (`type: spark.engine`, spark_conf with s3a MinIO endpoint)
+- `feast-spark-config` Secret — offline store spark_conf injected into `feature_store.yaml`
+
+### 8c — Apply FeatureStore CR
+
+```bash
+source .env
+envsubst < infrastructure/openshift/feast-operator.yaml | oc apply -f -
+```
+
+The CR:
+- Sets `spec.batchEngine.configMapRef: feast-spark-engine` — `SparkComputeEngine`
+- Sets `offlineStore.persistence.store.type: spark` — `SparkOfflineStore`
+- Sets `services.disableInitContainers: true` — init containers disabled (feast[minimal] init image lacks pyspark; we run `feast apply` manually)
+- Overrides all service images to `feast-spark-server:latest`
+- Online store: Redis via `feast-redis-secret`
+- Registry: file-backed PVC (1Gi `nfs-csi`)
+
+> **NFS double-mount gotcha:** The Feast pod runs registry, offline, and online containers
 > in the same pod. NFS CSI cannot mount the same PV twice within a single pod.
 > This is why the registry gets its own dedicated 1Gi PVC instead of reusing
-> `smartshop-shared-storage`. The offline store uses no PVC — Dask reads from S3 directly.
+> `smartshop-shared-storage`. The offline/online containers use no PVC.
+
+**Watch rollout (~2 min):**
+
+```bash
+oc get pods -n smartshop -l feast.dev/name=smartshop-feast -w
+# feast-smartshop-feast-xxxxxxxxx-xxxxx   0/4   Pending → 4/4   Running
+# (no Init: stages — init containers disabled)
+```
+
+**Verify:**
+
+```bash
+oc get featurestore -n smartshop
+# NAME              STATUS   AGE
+# smartshop-feast   Ready    Xm
+
+# Confirm pyspark is available in the pod
+oc exec -n smartshop deploy/feast-smartshop-feast -c offline -- python3 -c "import pyspark; print(pyspark.__version__)"
+# 4.0.0
+```
+
+### 8d — Enable Feature Store in RHOAI Dashboard
+
+The Feature Store tab defaults to **disabled**. Patch it once per cluster:
+
+```bash
+oc patch odhdashboardconfig odh-dashboard-config \
+  -n redhat-ods-applications \
+  --type=merge \
+  -p '{"spec":{"dashboardConfig":{"disableFeatureStore":false}}}'
+
+oc rollout restart deployment/rhods-dashboard -n redhat-ods-applications
+oc rollout status deployment/rhods-dashboard -n redhat-ods-applications
+```
+
+The FeatureStore CR has `label: feature-store-ui: enabled`. Verify:
+```bash
+oc get featurestore smartshop-feast -n smartshop \
+  -o jsonpath='{.metadata.labels.feature-store-ui}'
+# enabled
+```
+
+### 8e — Run `feast apply` (register schema)
+
+Because `disableInitContainers: true` is set, `feast apply` must be run manually after the pod starts. This requires the Spark ETL to have written Parquet already (or placeholder files — see note below):
+
+```bash
+FEAST_POD=$(oc get pod -n smartshop -l feast.dev/name=smartshop-feast \
+  -o jsonpath='{.items[0].metadata.name}')
+
+# Clone the repo inside the pod, then feast apply
+oc exec -n smartshop $FEAST_POD -c offline -- bash -c "
+  git clone -b feat/phase3-complete-rapids-docs-mlflow \
+    https://github.com/abhijeet-dhumal/prod-ml-demo.git /tmp/smartshop-repo &&
+  cd /tmp/smartshop-repo/feast/feature_repo &&
+  FEAST_REGISTRY_TYPE=file FEAST_REGISTRY_PATH=/feast-registry/registry.db \
+  feast apply
+"
+
+# Expected output:
+# Applying changes for project smartshop
+# Deploying infrastructure for user_features (SparkSource)
+# Deploying infrastructure for item_features (SparkSource)
+# Deploying infrastructure for review_embeddings (SparkSource)
+```
+
+> **SparkSource schema inference:** Unlike `FileSource` (which uses PyArrow to read schema),
+> `SparkSource` with `local[*]` starts a SparkSession to infer schema from the Parquet files.
+> The files must exist in MinIO before `feast apply` succeeds.
+> Run Phase 3 (Spark ETL) first, or write placeholder Parquet files (see note below).
+
+> **Placeholder files (if ETL not yet run):** Write 0-row Parquet files with the correct
+> schema to MinIO so SparkSource schema inference succeeds without real data. Use the
+> placeholder script from the old SETUP.md or run a small `spark.createDataFrame([], schema)`
+> inside the feast pod.
+
+### 8f — `feast materialize-incremental` (SparkComputeEngine → Redis)
+
+After Phase 3 (Spark ETL) writes real features to MinIO:
+
+```bash
+FEAST_POD=$(oc get pod -n smartshop -l feast.dev/name=smartshop-feast \
+  -o jsonpath='{.items[0].metadata.name}')
+
+oc exec -n smartshop $FEAST_POD -c offline -- bash -c "
+  cd /tmp/smartshop-repo/feast/feature_repo &&
+  FEAST_REGISTRY_TYPE=file FEAST_REGISTRY_PATH=/feast-registry/registry.db \
+  feast materialize-incremental \$(date -u +'%Y-%m-%dT%H:%M:%S')
+"
+
+# What happens internally:
+# 1. SparkComputeEngine reads batch_engine config from feature_store.yaml
+# 2. SparkSession starts (local[*]) — visible in Spark logs
+# 3. spark_session.read.parquet("s3a://smartshop-features/user_features/") via hadoop-aws
+# 4. Time-range filter applied (last materialize timestamp → now)
+# 5. mapInPandas() writes each row to Redis online store
+# 6. Redis DBSIZE increases
+```
+
+Verify Redis:
+```bash
+oc exec -n smartshop deploy/redis -- redis-cli -a ${REDIS_PASSWORD} DBSIZE
+# (integer) 12345  ← should be > 0
+```
+
+### 8g — Feast Hierarchy and Data Flow
+
+```
+Project: smartshop
+│
+├── Entities (join keys)
+│   ├── user_id   STRING  → user_features rows
+│   ├── item_id   STRING  → item_features rows
+│   └── review_id STRING  → review_embeddings rows
+│
+├── Data Sources (SparkSource — s3a:// Parquet)
+│   ├── s3a://smartshop-features/user_features/       ← RAPIDS Spark ETL output
+│   ├── s3a://smartshop-features/item_features/       ← RAPIDS Spark ETL output
+│   └── s3a://smartshop-embeddings/review_embeddings/ ← embedding Spark job output
+│
+├── Feature Views
+│   ├── user_features      6 numeric cols  TTL=30d  online=True
+│   ├── item_features      6 numeric cols  TTL=30d  online=True
+│   └── review_embeddings  384-dim vector  TTL=90d  online=True
+│
+└── Stores
+    ├── Offline  → SparkOfflineStore (MinIO s3a:// Parquet, Spark local[*])
+    ├── Online   → Redis (sub-ms serving)
+    └── Vector   → Milvus (ANN search for RAG)
+```
+
+### 8h — Training Integration (SparkOfflineStore in rec-trainer)
+
+The rec-trainer image includes `feast==0.62.0 + pyspark==4.0.0`. When `FEAST_REPO_PATH` is set in the TrainJob env, `train.py` uses `feast.get_historical_features()` instead of direct `pd.read_parquet`:
+
+```python
+# train.py — rank-0 only, result saved to /tmp, all ranks load from /tmp
+store = FeatureStore(repo_path=feast_repo_path)
+entity_df = interactions[["user_id", "item_id", "event_timestamp"]]
+entity_df["event_timestamp"] = pd.to_datetime(entity_df["event_timestamp"], unit="ms", utc=True)
+training_df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["user_features:user_avg_rating", ..., "item_features:item_price"],
+).to_df()
+```
+
+The training pod connects to the feast **registry server** (not the file PVC) via remote gRPC:
+- `FEAST_REGISTRY_TYPE=remote`
+- `FEAST_REGISTRY_PATH=feast-smartshop-feast-registry.smartshop.svc.cluster.local:6570`
+
+The training pod's SparkOfflineStore reads Parquet from MinIO directly (same s3a:// paths, same hadoop-aws JARs). It does **not** go through the feast server — only the registry lookup is remote.
 
 **Watch rollout (~2 min):**
 

@@ -1,0 +1,52 @@
+---
+# feast-spark-engine ConfigMap
+# Referenced by spec.batchEngine.configMapRef in the FeatureStore CR.
+# The operator injects this as batch_engine: {...} into feature_store.yaml.
+# type: spark.engine → SparkComputeEngine (runs SparkSession local[*] inside feast pod).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feast-spark-engine
+  namespace: ${NAMESPACE}
+data:
+  config: |
+    type: spark.engine
+    spark_conf:
+      spark.master: "local[*]"
+      spark.ui.enabled: "false"
+      spark.eventLog.enabled: "false"
+      spark.sql.session.timeZone: "UTC"
+      spark.sql.execution.arrow.pyspark.enabled: "true"
+      spark.sql.execution.arrow.fallback.enabled: "true"
+      spark.sql.shuffle.partitions: "8"
+      spark.hadoop.fs.s3a.endpoint: "http://minio.${NAMESPACE}.svc.cluster.local:9000"
+      spark.hadoop.fs.s3a.path.style.access: "true"
+      spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+      spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+      spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+    staging_location: "s3://smartshop-features/feast-staging/"
+
+---
+# feast-spark-config Secret
+# Referenced by spec.services.offlineStore.persistence.store.secretRef.
+# Key name defaults to the offline store type: "spark".
+# Content is merged into feature_store.yaml under offline_store (excluding type).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: feast-spark-config
+  namespace: ${NAMESPACE}
+stringData:
+  spark: |
+    spark_conf:
+      spark.master: "local[*]"
+      spark.ui.enabled: "false"
+      spark.sql.session.timeZone: "UTC"
+      spark.sql.execution.arrow.pyspark.enabled: "true"
+      spark.sql.execution.arrow.fallback.enabled: "true"
+      spark.hadoop.fs.s3a.endpoint: "http://minio.${NAMESPACE}.svc.cluster.local:9000"
+      spark.hadoop.fs.s3a.path.style.access: "true"
+      spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+      spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+      spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+    staging_location: "s3://smartshop-features/feast-staging/"

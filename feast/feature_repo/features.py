@@ -1,33 +1,35 @@
 """Feast feature definitions for SmartShop AI.
 
 Defines three feature views:
-  1. user_features - Per-user aggregates from review history
-  2. item_features - Per-item aggregates from reviews + metadata
-  3. review_embeddings - Vector embeddings for RAG similarity search
+  1. user_features   — per-user aggregates from review history
+  2. item_features   — per-item aggregates from reviews + metadata
+  3. review_embeddings — vector embeddings for RAG similarity search
 
-Offline store: dask (reads Parquet from MinIO S3 via FileSource).
-Registry: SQL-backed PostgreSQL (concurrent-write safe).
+Offline store: SparkOfflineStore (reads Parquet from MinIO via s3a://).
+  - Materialization: SparkComputeEngine local[*] inside feast-spark-server pod → Redis
+  - Training:        feast client in rec-trainer pod, same SparkSource → get_historical_features()
+Registry: file-backed PVC (feast server) OR remote gRPC client (training pod).
 Online store: Redis (sub-ms lookups at serving time).
 
-Production note: For full 571M-row scale, switch to SparkOfflineStore + SparkSource.
-This requires a custom Feast server image with pyspark installed (feastdev/feature-server
-does not ship pyspark). The feast-spark-config secret and feast-spark-rbac.yaml are
-already in place for when that upgrade is made.
+SparkSource uses s3a:// (hadoop-aws); FileSource used s3:// (pyarrow/fsspec).
+The feast-spark-server image adds pyspark==4.0.0 + hadoop-aws JARs on top of
+quay.io/feastdev/feature-server:0.62.0.
+
+See docs/FEAST-SPARK.md for the full architecture and upgrade notes.
 """
 
 from datetime import timedelta
 
-import os
-
-from feast import Entity, FeatureView, Field, FileSource
+from feast import Entity, FeatureView, Field
+from feast.infra.offline_stores.contrib.spark_offline_store.spark_source import SparkSource
 from feast.types import Array, Float32, Float64, Int64, String
 from feast.value_type import ValueType
 
-# PyArrow S3FileSystem ignores AWS_ENDPOINT_URL_S3 when endpoint_override is not
-# passed explicitly. Always read from env so local dev and in-cluster both work.
-_S3_ENDPOINT = os.environ.get(
-    "AWS_ENDPOINT_URL_S3", "http://minio.smartshop.svc.cluster.local:9000"
-)
+# s3a:// is required for SparkSource — Spark uses hadoop-aws (S3AFileSystem).
+# The endpoint and credentials come from spark_conf in feature_store.yaml
+# (spark.hadoop.fs.s3a.endpoint + EnvironmentVariableCredentialsProvider).
+_S3A = "s3a://smartshop-features"
+_S3A_EMB = "s3a://smartshop-embeddings"
 
 # -- Entities --
 
@@ -49,26 +51,30 @@ review = Entity(
     description="Unique review identifier for embedding lookup",
 )
 
-# -- Data Sources (MinIO / S3 via FileSource) --
-# Paths written by Spark ETL (spark-application.yaml / spark-application-rapids.yaml).
-# `feast apply` registers schema even before data exists; `feast materialize` reads the data.
+# -- Data Sources (MinIO / S3 via SparkSource) --
+# Paths written by Spark ETL (spark-application-rapids.yaml).
+# feast apply registers schema; feast materialize-incremental reads + writes to Redis.
+# Training: get_historical_features() uses the same SparkSource with Spark local[*].
 
-user_features_source = FileSource(
-    path="s3://smartshop-features/user_features/",
+user_features_source = SparkSource(
+    name="user_features_source",
+    path=f"{_S3A}/user_features/",
+    file_format="parquet",
     timestamp_field="event_timestamp",
-    s3_endpoint_override=_S3_ENDPOINT,
 )
 
-item_features_source = FileSource(
-    path="s3://smartshop-features/item_features/",
+item_features_source = SparkSource(
+    name="item_features_source",
+    path=f"{_S3A}/item_features/",
+    file_format="parquet",
     timestamp_field="event_timestamp",
-    s3_endpoint_override=_S3_ENDPOINT,
 )
 
-review_embeddings_source = FileSource(
-    path="s3://smartshop-embeddings/review_embeddings/",
+review_embeddings_source = SparkSource(
+    name="review_embeddings_source",
+    path=f"{_S3A_EMB}/review_embeddings/",
+    file_format="parquet",
     timestamp_field="event_timestamp",
-    s3_endpoint_override=_S3_ENDPOINT,
 )
 
 # -- Feature Views --

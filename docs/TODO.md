@@ -133,80 +133,89 @@ oc get route grafana -n smartshop -o jsonpath='{.spec.host}'
 
 ---
 
-## Phase 4 — Feast Materialization (Spark-backed)
+## Phase 4 — Feast Materialization (SparkComputeEngine → Redis)
 
-> **Goal:** Redis has materialized user and item features via `SparkComputeEngine`; `redis_db_keys > 0`.  
-> **Requires:** Phase 3 feature Parquet files in MinIO.  
-> **Architecture:** Feast pod runs a local PySpark session (`local[*]`), reads `SparkSource` → writes to Redis.  
-> **See:** `docs/FEAST-SPARK.md` for full architecture findings.  
-> **Blocker for:** Model training (rec model reads features from Feast).
+> **Goal:** Redis has materialized user and item features; `redis_db_keys > 0`.  
+> **Architecture:** `feast-spark-server` pod runs SparkComputeEngine `local[*]` → reads `SparkSource` Parquet from MinIO → writes to Redis.  
+> **New in this phase:** `FileSource` replaced with `SparkSource` (`s3a://`); custom image with `pyspark==4.0.0`.  
+> **See:** `docs/FEAST-SPARK.md` for full architecture. `docs/SETUP.md` §8 for step-by-step.  
+> **Blocker for:** Phase 5 online serving lookup. Phase 5 training (Feast path).
 
-### 4a — Build feast-spark custom image
+### 4a — Build feast-spark-server image ✅ (files created)
 
-> The default `feature-server:0.62.0` ships only `feast[minimal]` (no pyspark). We build a custom image  
-> with `pyspark==4.0.0` + `feast[spark]` + hadoop-aws JARs for `s3a://` MinIO access.
+> `build/Containerfile.feast-spark` extends `feature-server:0.62.0` with `pyspark==4.0.0` + hadoop-aws JARs.  
+> BuildConfig + ImageStream already added to `infrastructure/openshift/`.
 
 | Status | # | Step | Command | Done when |
 |---|---|---|---|---|
-| 🔲 | 4.1 | Create `build/Containerfile.feast-spark` | See `docs/FEAST-SPARK.md` § "Custom feast-spark image" | File exists in repo |
-| 🔲 | 4.2 | Create `infrastructure/openshift/feast-spark-buildconfig.yaml` | See `docs/FEAST-SPARK.md` § "BuildConfig" | File exists in repo |
-| 🔲 | 4.3 | Apply ImageStream + BuildConfig | `oc apply -f infrastructure/openshift/feast-spark-buildconfig.yaml` | BC created |
-| 🔲 | 4.4 | Start build | `oc start-build feast-spark-server -n smartshop --follow` | Build `Complete` |
+| ✅ | 4.1 | `build/Containerfile.feast-spark` created | — | File in repo |
+| ✅ | 4.2 | ImageStream `feast-spark-server` added to `imagestreams.yaml` | — | File updated |
+| ✅ | 4.3 | BuildConfig `feast-spark-server` added to `buildconfigs.yaml` | — | File updated |
+| 🔲 | 4.4 | Apply ImageStream + BuildConfig | `source .env && envsubst < infrastructure/openshift/imagestreams.yaml \| oc apply -f - && envsubst < infrastructure/openshift/buildconfigs.yaml \| oc apply -f -` | Resources created |
+| 🔲 | 4.5 | Start build (~5-10 min) | `oc start-build feast-spark-server -n smartshop --follow` | Build `Complete` |
 
-### 4b — Update Feast feature repo for SparkSource
-
-> Switch `FileSource` (`s3://`) → `SparkSource` (`s3a://`) in `features.py` and update `feature_store.yaml`.  
-> No changes to ETL SparkApplication manifests — only the materialization layer changes.
+### 4b — Feature repo updated for SparkSource ✅
 
 | Status | # | Step | Done when |
 |---|---|---|---|
-| 🔲 | 4.5 | Update `feast/feature_repo/features.py`: `FileSource` → `SparkSource`, `s3://` → `s3a://` | Import `SparkSource`, remove `s3_endpoint_override` |
-| 🔲 | 4.6 | Update `feast/feature_repo/feature_store.yaml`: `offline_store.type: file` → `type: spark` + s3a spark_conf | `type: spark` with `spark.hadoop.fs.s3a.*` keys |
+| ✅ | 4.6 | `feast/feature_repo/features.py`: `FileSource` → `SparkSource`, `s3://` → `s3a://` | `from feast.infra.offline_stores.contrib.spark_offline_store.spark_source import SparkSource` |
+| ✅ | 4.7 | `feast/feature_repo/feature_store.yaml`: `offline_store.type: spark` + full spark_conf + env-var registry | `type: spark`, `FEAST_REGISTRY_TYPE` env var |
 
-### 4c — Apply Feast Kubernetes config changes
-
-| Status | # | Step | Command | Done when |
-|---|---|---|---|---|
-| 🔲 | 4.7 | Create `feast-spark-engine` ConfigMap (SparkComputeEngine config) | `oc apply -f infrastructure/openshift/feast-spark-engine.yaml` | CM exists |
-| 🔲 | 4.8 | Create `feast-spark-config` Secret (SparkOfflineStore spark_conf) | `oc apply -f infrastructure/openshift/feast-spark-engine.yaml` | Secret exists |
-| 🔲 | 4.9 | Update FeatureStore CR: add `batchEngine`, switch `offlineStore.type: spark`, set custom image | `oc apply -f infrastructure/openshift/feast-operator.yaml` | Feast pod restarts with new image |
-| 🔲 | 4.10 | Wait for feast pod ready with new image | `oc rollout status deploy/smartshop-feast -n smartshop` | All containers Running |
-| 🔲 | 4.11 | Verify feast pod uses spark image | `oc get pod -l feast.dev/name=smartshop-feast -n smartshop -o jsonpath='{.items[0].spec.containers[*].image}'` | Shows `feast-spark-server:latest` |
-
-### 4d — Run feast apply + materialize
+### 4c — Apply Feast Kubernetes config
 
 | Status | # | Step | Command | Done when |
 |---|---|---|---|---|
-| 🔲 | 4.12 | `feast apply` (re-register SparkSource views) | `FEAST_POD=$(oc get pod -n smartshop -l feast.dev/name=smartshop-feast -o jsonpath='{.items[0].metadata.name}') && oc exec -n smartshop $FEAST_POD -c offline -- bash -c "cd /feast/feature_repo && feast apply"` | No errors; feature views registered |
-| 🔲 | 4.13 | `feast materialize-incremental` (SparkComputeEngine → Redis) | `oc exec -n smartshop $FEAST_POD -c offline -- bash -c "cd /feast/feature_repo && feast materialize-incremental $(date -u +%Y-%m-%dT%H:%M:%S)"` | Logs show Spark job + rows written to Redis |
-| 🔲 | 4.14 | Verify Redis has feature keys | `oc exec -n smartshop deploy/redis -- redis-cli -a smartshop-redis-2026 DBSIZE` | Count > 0 |
-| 🔲 | 4.15 | Check Redis ops in Grafana | Open Redis Feature Store dashboard | Keys visible, ops/sec non-zero |
+| ✅ | 4.8 | `feast-spark-engine.yaml` (ConfigMap + Secret) created | — | File in repo |
+| ✅ | 4.9 | `feast-operator.yaml` (FeatureStore CR with SparkComputeEngine) created | — | File in repo |
+| 🔲 | 4.10 | Apply ConfigMap + Secret | `source .env && envsubst < infrastructure/openshift/feast-spark-engine.yaml \| oc apply -f -` | CM + Secret exist |
+| 🔲 | 4.11 | Apply FeatureStore CR (triggers Deployment restart) | `source .env && envsubst < infrastructure/openshift/feast-operator.yaml \| oc apply -f -` | Feast pod restarts |
+| 🔲 | 4.12 | Wait for pod ready + verify pyspark | `oc get pod -l feast.dev/name=smartshop-feast -n smartshop -w` then `oc exec ... -c offline -- python3 -c "import pyspark; print(pyspark.__version__)"` | `4.0.0` |
+
+### 4d — Run feast apply + materialize-incremental
+
+| Status | # | Step | Command | Done when |
+|---|---|---|---|---|
+| 🔲 | 4.13 | Clone repo + `feast apply` in pod | `oc exec $FEAST_POD -c offline -- bash -c "git clone ... /tmp/repo && cd /tmp/repo/feast/feature_repo && FEAST_REGISTRY_TYPE=file FEAST_REGISTRY_PATH=/feast-registry/registry.db feast apply"` | Feature views registered (SparkSource) |
+| 🔲 | 4.14 | `feast materialize-incremental` (SparkComputeEngine) | `oc exec $FEAST_POD -c offline -- bash -c "cd /tmp/repo/feast/feature_repo && FEAST_REGISTRY_TYPE=file FEAST_REGISTRY_PATH=/feast-registry/registry.db feast materialize-incremental $(date -u +%Y-%m-%dT%H:%M:%S)"` | Spark log + rows → Redis |
+| 🔲 | 4.15 | Verify Redis keys | `oc exec -n smartshop deploy/redis -- redis-cli -a $REDIS_PASSWORD DBSIZE` | Count > 0 |
+| 🔲 | 4.16 | Redis Grafana dashboard | Open Grafana → Redis dashboard | Keys visible |
 
 ---
 
-## Phase 5 — Model Training
+## Phase 5 — Model Training (Feast SparkOfflineStore + DDP)
 
-> **Goal:** Trained model artifacts in `s3://smartshop-models/`.
-> **Requires:** Feast materialized (Phase 4) for rec model; embedding features (Phase 3c) for LLM.
+> **Goal:** Trained model artifacts in `s3://smartshop-models/`.  
+> **Requires:** Phase 3 Parquet in MinIO (for both Feast + direct paths); Phase 4 Redis keys (for serving).  
+> **New in this phase:** `train.py` uses `feast.get_historical_features()` via `SparkOfflineStore local[*]` for point-in-time correct training data. Direct `pd.read_parquet` is the `--no-feast` fallback.  
+> **rec-trainer image:** now includes `pyspark==4.0.0 + feast==0.62.0` (from `build/requirements/training.txt`).
 
-### 5a — Recommendation Model (PyTorch DDP, 4× A100, 1 node)
+### 5a — Recommendation Model (PyTorch DDP 4× A100 + Feast SparkOfflineStore)
+
+> Training flow: rank-0 calls `feast.get_historical_features(entity_df)` → SparkSession `local[*]` reads  
+> `SparkSource` Parquet → point-in-time join → saves to `/tmp/training_data.parquet` → `dist.barrier()` →  
+> all ranks load from `/tmp` → `RecommendationDataset` → DDP training.
 
 | Status | # | Step | Command | Done when |
 |---|---|---|---|---|
-| 🔲 | 5.1 | Apply TrainingRuntime + TrainJob (rec) | `source .env && envsubst < infrastructure/openshift/trainjobs.yaml \| oc apply -f - --field-manager=rec` | `oc get trainjob smartshop-rec-train -n smartshop` |
-| 🔲 | 5.2 | Monitor training progress | `oc get trainjob smartshop-rec-train -n smartshop -w` | Status = Complete |
-| 🔲 | 5.3 | Check MLflow for loss curves | Open MLflow → `smartshop-rec-train` experiment | Loss converging |
-| 🔲 | 5.4 | Verify model in MinIO | `aws s3 ls s3://smartshop-models/recommendation/` | `best_model.pt` exists |
+| ✅ | 5.1 | `train.py`: added `_load_features_via_feast()` + `--use-feast/--no-feast` flag | — | Code in repo |
+| ✅ | 5.2 | `build/requirements/training.txt`: added `pyspark==4.0.0 feast==0.62.0` | — | File updated |
+| 🔲 | 5.3 | Rebuild rec-trainer image | `oc start-build rec-trainer -n smartshop --follow` | Build `Complete` |
+| 🔲 | 5.4 | Set `FEAST_REPO_PATH` + registry env in `.env` | `FEAST_REPO_PATH=/tmp/smartshop-repo/feast/feature_repo` + `FEAST_REGISTRY_TYPE=remote` + `FEAST_REGISTRY_PATH=feast-smartshop-feast-registry.smartshop.svc.cluster.local:6570` | `.env` updated |
+| 🔲 | 5.5 | Apply TrainingRuntime + TrainJob (rec) | `source .env && envsubst < infrastructure/openshift/trainjobs.yaml \| oc apply -f - --field-manager=rec` | TrainJob created |
+| 🔲 | 5.6 | Watch rank-0 Feast log | `oc logs -n smartshop <rec-train-worker-0-pod> -f \| grep "\[Feast\]"` | `[Feast] retrieved N rows in Xs` |
+| 🔲 | 5.7 | Watch DDP training | `oc get trainjob smartshop-rec-train -n smartshop -w` | Status = Complete |
+| 🔲 | 5.8 | MLflow loss curves | Open MLflow → `smartshop-rec-training` experiment | Loss converging, `feature_source=feast_spark` logged |
+| 🔲 | 5.9 | Verify model in MinIO | `aws s3 ls s3://smartshop-models/recommendation/` | `best_model.pt` exists |
 
 ### 5b — LLM Fine-Tuning (Mistral-7B, FSDP + QLoRA, Slurm, 2 nodes × 4 A100)
 
 | Status | # | Step | Command | Done when |
 |---|---|---|---|---|
-| 🔲 | 5.5 | Verify Slurm partition is available | `oc exec -n smartshop <llm-trainer-pod> -- sinfo -p slinky` | Nodes idle or allocated |
-| 🔲 | 5.6 | Apply LLM TrainJob | `source .env && envsubst < infrastructure/openshift/trainjobs.yaml \| oc apply -f -` | `oc get trainjob smartshop-llm-finetune -n smartshop` |
-| 🔲 | 5.7 | Verify NCCL bandwidth (cross-node) | `oc logs -n smartshop <worker-pod> \| grep "busBw\|Avg bus"` | `> 100 GB/s` |
-| 🔲 | 5.8 | Collect Slurm metrics bundle | `RUN_TYPE=slurm TRAINJOB_NAME=smartshop-llm-finetune bash scripts/collect-run-metrics.sh` | Bundle in MinIO |
-| 🔲 | 5.9 | Verify adapter in MinIO | `aws s3 ls s3://smartshop-models/llm-adapter/` | Adapter weights exist |
+| 🔲 | 5.10 | Verify Slurm partition available | `oc exec -n smartshop <llm-trainer-pod> -- sinfo -p slinky` | Nodes idle or allocated |
+| 🔲 | 5.11 | Apply LLM TrainJob | `source .env && envsubst < infrastructure/openshift/trainjobs.yaml \| oc apply -f -` | `oc get trainjob smartshop-llm-finetune -n smartshop` |
+| 🔲 | 5.12 | Verify NCCL bandwidth (cross-node) | `oc logs -n smartshop <worker-pod> \| grep "busBw\|Avg bus"` | `> 100 GB/s` |
+| 🔲 | 5.13 | Collect Slurm metrics bundle | `RUN_TYPE=slurm TRAINJOB_NAME=smartshop-llm-finetune bash scripts/collect-run-metrics.sh` | Bundle in MinIO |
+| 🔲 | 5.14 | Verify adapter in MinIO | `aws s3 ls s3://smartshop-models/llm-adapter/` | Adapter weights exist |
 
 ---
 

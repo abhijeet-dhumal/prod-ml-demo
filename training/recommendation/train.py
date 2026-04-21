@@ -1,10 +1,22 @@
 """Distributed training script for Two-Tower recommendation model.
 
 Uses PyTorch DDP (DistributedDataParallel) for multi-GPU training.
-Reads training data from Feast offline store.
+
+Feature retrieval — two modes controlled by --use-feast flag:
+
+  --use-feast (default when FEAST_REPO_PATH is set):
+    feast.get_historical_features() with SparkOfflineStore (local[*]).
+    Rank-0 runs point-in-time correct Spark join against SparkSource Parquet
+    in MinIO, saves result to /tmp/training_data.parquet, all ranks load it.
+    Requires: pyspark==4.0.0, feast[spark], FEAST_REPO_PATH env var,
+              FEAST_REGISTRY_TYPE=remote, FEAST_REGISTRY_PATH=<svc>:6570
+
+  --no-feast:
+    Direct pd.read_parquet from s3://smartshop-features/ (legacy path).
+    Faster startup, no Feast dependency, no point-in-time correctness.
 
 Usage (single node):
-    torchrun --nproc_per_node=4 training/recommendation/train.py
+    torchrun --nproc_per_node=4 training/recommendation/train.py --use-feast
 
 Usage (multi-node via Kubeflow Trainer):
     Launched automatically by TrainJob with TrainingRuntime: pytorch-ddp
@@ -31,7 +43,35 @@ try:
 except ImportError:
     HAS_FSSPEC = False
 
+try:
+    from feast import FeatureStore
+    HAS_FEAST = True
+except ImportError:
+    HAS_FEAST = False
+
 from model import TwoTowerModel
+
+# Feature columns served by Feast feature views
+_USER_FEAT_COLS = [
+    "user_avg_rating",
+    "user_review_count",
+    "user_unique_items",
+    "user_avg_review_length",
+    "user_category_count",
+    "user_tenure_days",
+]
+_ITEM_FEAT_COLS = [
+    "item_avg_rating",
+    "item_rating_stddev",
+    "item_review_count",
+    "item_total_helpful_votes",
+    "item_avg_review_length",
+    "item_price",
+]
+_FEAST_FEATURES = (
+    [f"user_features:{c}" for c in _USER_FEAT_COLS]
+    + [f"item_features:{c}" for c in _ITEM_FEAT_COLS]
+)
 
 
 def _is_s3(path: str) -> bool:
@@ -59,64 +99,92 @@ def _save_checkpoint(state: dict, path: str) -> None:
         torch.save(state, path)
 
 
-class RecommendationDataset(Dataset):
-    """Dataset that loads user-item interactions with Feast features."""
+def _load_features_via_feast(interactions_df: pd.DataFrame, feast_repo_path: str) -> pd.DataFrame:
+    """Point-in-time correct feature retrieval via Feast SparkOfflineStore.
 
-    def __init__(
-        self,
-        interactions_path: str,
-        user_features_path: str,
-        item_features_path: str,
-        storage_options: dict = None,
-    ):
-        kw = {"storage_options": storage_options} if storage_options else {}
-        self.interactions = pd.read_parquet(interactions_path, **kw)
-        user_feats = pd.read_parquet(user_features_path, **kw)
-        item_feats = pd.read_parquet(item_features_path, **kw)
+    Rank-0 only. Calls store.get_historical_features() which triggers a
+    SparkSession (local[*]) to join interactions against SparkSource Parquet
+    in MinIO. Returns a merged DataFrame with all feature columns.
+
+    Registry is read from the feast server's gRPC endpoint via remote registry
+    (FEAST_REGISTRY_TYPE=remote, FEAST_REGISTRY_PATH=<svc>:6570).
+    """
+    if not HAS_FEAST:
+        raise RuntimeError("feast not installed — run: pip install feast[spark]==0.62.0")
+
+    store = FeatureStore(repo_path=feast_repo_path)
+
+    # entity_df: user_id + item_id + UTC-aware event_timestamp for point-in-time join
+    entity_df = interactions_df[["user_id", "item_id", "event_timestamp", "label"]].copy()
+    entity_df["event_timestamp"] = pd.to_datetime(
+        entity_df["event_timestamp"], unit="ms", utc=True
+    )
+
+    print(f"[Feast] get_historical_features for {len(entity_df):,} interactions...")
+    t0 = time.time()
+    training_df = store.get_historical_features(
+        entity_df=entity_df,
+        features=_FEAST_FEATURES,
+    ).to_df()
+    print(f"[Feast] retrieved {len(training_df):,} rows in {time.time()-t0:.1f}s")
+
+    # Fill missing features (entities with no feature row in offline store)
+    for col in _USER_FEAT_COLS + _ITEM_FEAT_COLS:
+        if col not in training_df.columns:
+            training_df[col] = 0.0
+        else:
+            training_df[col] = training_df[col].fillna(0.0)
+
+    return training_df
+
+
+def _load_features_direct(
+    interactions_path: str,
+    user_features_path: str,
+    item_features_path: str,
+    storage_options: dict = None,
+) -> pd.DataFrame:
+    """Direct pd.read_parquet path — no Feast, no point-in-time correctness.
+
+    Legacy fallback for quick iteration or environments without pyspark.
+    Feature join is done in pandas: interactions LEFT JOIN user_features
+    LEFT JOIN item_features on user_id / item_id.
+    """
+    kw = {"storage_options": storage_options} if storage_options else {}
+    interactions = pd.read_parquet(interactions_path, **kw)
+    user_feats = pd.read_parquet(user_features_path, **kw)
+    item_feats = pd.read_parquet(item_features_path, **kw)
+
+    user_feats = user_feats[["user_id"] + _USER_FEAT_COLS].drop_duplicates("user_id")
+    item_feats = item_feats.rename(columns={"parent_asin": "item_id"})
+    item_cols_avail = [c for c in _ITEM_FEAT_COLS if c in item_feats.columns]
+    item_feats = item_feats[["item_id"] + item_cols_avail].drop_duplicates("item_id")
+
+    df = interactions.merge(user_feats, on="user_id", how="left")
+    df = df.merge(item_feats, on="item_id", how="left")
+    for col in _USER_FEAT_COLS + _ITEM_FEAT_COLS:
+        if col not in df.columns:
+            df[col] = 0.0
+        else:
+            df[col] = df[col].fillna(0.0)
+    return df
+
+
+class RecommendationDataset(Dataset):
+    """Dataset wrapping a pre-loaded DataFrame with user-item features."""
+
+    def __init__(self, data: pd.DataFrame):
+        self.data = data
 
         # Build ID mappings
-        all_users = self.interactions["user_id"].unique()
-        all_items = self.interactions["item_id"].unique()
+        all_users = self.data["user_id"].unique()
+        all_items = self.data["item_id"].unique()
         self.user_to_idx = {uid: i for i, uid in enumerate(all_users)}
         self.item_to_idx = {iid: i for i, iid in enumerate(all_items)}
         self.num_users = len(all_users)
         self.num_items = len(all_items)
-
-        # Numeric feature columns
-        self.user_feat_cols = [
-            "user_avg_rating",
-            "user_review_count",
-            "user_unique_items",
-            "user_avg_review_length",
-            "user_category_count",
-            "user_tenure_days",
-        ]
-        self.item_feat_cols = [
-            "item_avg_rating",
-            "item_rating_stddev",
-            "item_review_count",
-            "item_total_helpful_votes",
-            "item_avg_review_length",
-            "item_price",
-        ]
-
-        # Merge features into interactions
-        user_feats = user_feats[["user_id"] + self.user_feat_cols].drop_duplicates("user_id")
-        item_feats_renamed = item_feats.rename(columns={"parent_asin": "item_id"})
-        item_feat_cols_available = [c for c in self.item_feat_cols if c in item_feats_renamed.columns]
-        item_feats_renamed = item_feats_renamed[["item_id"] + item_feat_cols_available].drop_duplicates("item_id")
-
-        self.data = self.interactions.merge(user_feats, on="user_id", how="left")
-        self.data = self.data.merge(item_feats_renamed, on="item_id", how="left")
-
-        # Fill NaN features with 0
-        for col in self.user_feat_cols + item_feat_cols_available:
-            self.data[col] = self.data[col].fillna(0.0)
-
-        # Pad missing item feature columns
-        for col in self.item_feat_cols:
-            if col not in self.data.columns:
-                self.data[col] = 0.0
+        self.user_feat_cols = _USER_FEAT_COLS
+        self.item_feat_cols = _ITEM_FEAT_COLS
 
     def __len__(self):
         return len(self.data)
@@ -208,21 +276,31 @@ def evaluate(model, dataloader, criterion, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="data/processed", help="Feature data directory (s3:// or local)")
+    parser.add_argument("--data-dir", default="data/processed", help="Feature data dir (s3:// or local). Used in --no-feast mode.")
     parser.add_argument("--output-dir", default="models/recommendation", help="Model output dir (s3:// or local)")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--embed-dim", type=int, default=64)
     parser.add_argument("--hidden-dim", type=int, default=128)
+    feast_group = parser.add_mutually_exclusive_group()
+    feast_group.add_argument("--use-feast", dest="use_feast", action="store_true",
+                             default=bool(os.environ.get("FEAST_REPO_PATH")),
+                             help="Use feast.get_historical_features() via SparkOfflineStore")
+    feast_group.add_argument("--no-feast", dest="use_feast", action="store_false",
+                             help="Read Parquet directly from --data-dir (legacy)")
     args = parser.parse_args()
 
     rank, local_rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     job_start = time.time()
 
+    feast_repo_path = os.environ.get("FEAST_REPO_PATH", "")
+    use_feast = args.use_feast and bool(feast_repo_path)
+
     if rank == 0:
         print(f"Training with {world_size} processes on {device}")
+        print(f"Feature source: {'Feast SparkOfflineStore' if use_feast else 'direct Parquet'}")
         mlflow_uri = os.environ.get("MLFLOW_TRACKING_URI")
         if mlflow_uri:
             mlflow.set_tracking_uri(mlflow_uri)
@@ -241,9 +319,14 @@ def main():
             "world_size": world_size,
             "device": str(device),
             "data_dir": args.data_dir,
+            "feature_source": "feast_spark" if use_feast else "direct_parquet",
         })
 
-    # Load dataset — pandas reads S3 via s3fs if installed
+    # ---- Feature loading -------------------------------------------------------
+    # Rank-0 loads training data (Feast or direct), saves to /tmp for other ranks.
+    # dist.barrier() ensures rank-0 finishes before others read /tmp.
+    _STAGING = "/tmp/smartshop_training_data.parquet"
+
     storage_options = None
     if _is_s3(args.data_dir):
         endpoint = os.environ.get("AWS_ENDPOINT_URL_S3", os.environ.get("S3_ENDPOINT", ""))
@@ -254,12 +337,27 @@ def main():
                 "client_kwargs": {"endpoint_url": endpoint},
             }
 
-    dataset = RecommendationDataset(
-        interactions_path=f"{args.data_dir}/interactions",
-        user_features_path=f"{args.data_dir}/user_features",
-        item_features_path=f"{args.data_dir}/item_features",
-        storage_options=storage_options,
-    )
+    if rank == 0:
+        if use_feast:
+            # Load interactions only (needed as entity_df for the Feast join)
+            kw = {"storage_options": storage_options} if storage_options else {}
+            interactions_df = pd.read_parquet(f"{args.data_dir}/interactions", **kw)
+            df = _load_features_via_feast(interactions_df, feast_repo_path)
+        else:
+            df = _load_features_direct(
+                interactions_path=f"{args.data_dir}/interactions",
+                user_features_path=f"{args.data_dir}/user_features",
+                item_features_path=f"{args.data_dir}/item_features",
+                storage_options=storage_options,
+            )
+        df.to_parquet(_STAGING, index=False)
+        print(f"[rank-0] saved {len(df):,} rows to {_STAGING}")
+
+    if world_size > 1:
+        dist.barrier()  # wait for rank-0 to finish writing
+
+    df = pd.read_parquet(_STAGING)
+    dataset = RecommendationDataset(df)
 
     # Train/val split
     train_size = int(0.9 * len(dataset))

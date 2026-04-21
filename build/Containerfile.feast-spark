@@ -1,0 +1,37 @@
+# feast-spark-server image
+#
+# Extends quay.io/feastdev/feature-server:0.62.0 (feast[minimal], Python 3.12, UBI9)
+# with pyspark==4.0.0 and hadoop-aws JARs for s3a:// MinIO access.
+#
+# Used by:
+#   - feast-spark-server pod  (SparkComputeEngine materialize → Redis)
+#   - rec-trainer pod         (SparkOfflineStore get_historical_features → training)
+#
+# feast[spark] code is already present in feast[minimal] package tree; only pyspark
+# itself was missing. No feast reinstall needed — just add the runtime dependency.
+#
+# Hadoop-AWS JARs: must match PySpark 4.0's bundled Spark 4.0 / Hadoop 3.4.x.
+#   hadoop-aws-3.4.0.jar + aws-java-sdk-bundle-1.12.367.jar
+
+FROM quay.io/feastdev/feature-server:0.62.0
+
+USER 0
+
+# Install pyspark (feast[spark] extra dependency)
+RUN pip install --no-cache-dir pyspark==4.0.0
+
+# Locate pyspark jars directory dynamically — works regardless of Python site-packages path
+# Then download hadoop-aws + aws-sdk JARs for s3a:// MinIO support
+RUN SPARK_JARS=$(python3 -c 'import pyspark, os; print(os.path.join(os.path.dirname(pyspark.__file__), "jars"))') && \
+    echo "Installing hadoop-aws JARs into ${SPARK_JARS}" && \
+    curl -fsSL -o "${SPARK_JARS}/hadoop-aws-3.4.0.jar" \
+      https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.4.0/hadoop-aws-3.4.0.jar && \
+    curl -fsSL -o "${SPARK_JARS}/aws-java-sdk-bundle-1.12.367.jar" \
+      https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.367/aws-java-sdk-bundle-1.12.367.jar && \
+    echo "JAR sizes:" && ls -lh "${SPARK_JARS}/hadoop-aws-3.4.0.jar" "${SPARK_JARS}/aws-java-sdk-bundle-1.12.367.jar"
+
+# Allow non-root user (1001) to write Spark temp dirs
+RUN mkdir -p /tmp/spark-events /tmp/spark-warehouse && \
+    chmod -R g+w /tmp/spark-events /tmp/spark-warehouse
+
+USER 1001
