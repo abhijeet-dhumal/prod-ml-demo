@@ -253,6 +253,90 @@ by the platform team** before data scientists begin:
 
 ---
 
+## Post-Summit Upgrade: SparkOfflineStore + SparkSource
+
+Per the [Feast Production Deployment Topologies](https://github.com/ntkathole/feast/blob/prod_deploy/docs/how-to-guides/production-deployment-topologies.md) guide, the recommended stack for OpenShift / on-prem at >100M rows is:
+
+> **Offline Store: Spark + MinIO · Compute Engine: Spark**
+
+### Current state (Summit demo)
+
+```
+SparkApplication (RHOAI Spark Operator) → Parquet on MinIO
+  ↓
+Feast FileSource + dask offline store → Redis (1.7 GiB, works fine for demo)
+```
+
+This pattern is valid but Feast doesn't control the Spark jobs — we manage SparkApplications manually.
+
+### Ideal state (post-Summit)
+
+```
+Feast materialize-incremental
+  → submits SparkJob via SparkOfflineStore
+  → SparkSource reads Parquet from MinIO
+  → writes to Redis
+```
+
+Feast owns the full materialize lifecycle. `feast materialize-incremental` triggers a SparkApplication automatically.
+
+### What needs to change
+
+**1. Custom feast image with pyspark:**
+```dockerfile
+FROM quay.io/opendatahub/opendatahub-feast:latest
+USER 0
+RUN pip install pyspark==3.5.3 feast[spark]
+USER 1001
+```
+
+**2. `feature_store.yaml` — swap to SparkOfflineStore:**
+```yaml
+offline_store:
+  type: spark
+  spark_conf:
+    spark.master: "k8s://https://kubernetes.default.svc"
+    spark.submit.deployMode: cluster
+    spark.kubernetes.namespace: smartshop
+    spark.kubernetes.container.image: quay.io/abdhumal/smartshop-spark-jobs-rapids:latest
+    spark.hadoop.fs.s3a.endpoint: "http://minio.smartshop.svc.cluster.local:9000"
+    spark.hadoop.fs.s3a.path.style.access: "true"
+    spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+```
+
+**3. `features.py` — swap `FileSource` → `SparkSource`:**
+```python
+from feast.infra.offline_stores.contrib.spark_offline_store.spark_source import SparkSource
+
+user_features_source = SparkSource(
+    path="s3a://smartshop-features/user_features/",
+    file_format="parquet",
+    timestamp_field="event_timestamp",
+)
+```
+
+**4. FeatureStore CR — set custom image + disable init containers:**
+```yaml
+services:
+  offlineStore:
+    persistence:
+      file:
+        type: spark
+    server:
+      image: quay.io/abdhumal/smartshop-feast-spark:latest
+```
+
+### Why this matters for scale
+
+| Scale | Current (dask) | Ideal (Spark) |
+|-------|---------------|---------------|
+| 1.7 GiB feature Parquet | ✅ works | ✅ works |
+| 112 GiB full features | ⚠️ likely OOM | ✅ distributed |
+| 571M row full dataset | ❌ not viable | ✅ designed for this |
+| Scheduled materialization | Manual CronJob | `feast materialize-incremental` |
+
+---
+
 ## Summary — Top 5 Platform Investments for RHOAI
 
 Ranked by impact on adoption of this stack:

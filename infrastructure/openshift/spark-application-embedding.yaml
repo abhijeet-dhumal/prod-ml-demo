@@ -30,7 +30,7 @@ spec:
   mainApplicationFile: "local:///opt/spark/work-dir/embedding_generation.py"
   arguments:
     - "--input"
-    - "s3a://${S3_RAW_BUCKET}/raw/reviews/"
+    - "s3a://${S3_RAW_BUCKET}/raw/reviews/Electronics/,s3a://${S3_RAW_BUCKET}/raw/reviews/Books/,s3a://${S3_RAW_BUCKET}/raw/reviews/Home_and_Kitchen/"
     - "--output"
     - "s3a://${S3_EMBEDDINGS_BUCKET}/review_embeddings/"
     - "--max-reviews"
@@ -61,6 +61,8 @@ spec:
     envFrom:
       - secretRef:
           name: smartshop-credentials
+      - secretRef:
+          name: smartshop-mlflow-token
     volumeMounts:
       - name: spark-metrics-config
         mountPath: /etc/spark-metrics
@@ -76,6 +78,8 @@ spec:
     envFrom:
       - secretRef:
           name: smartshop-credentials
+      - secretRef:
+          name: smartshop-mlflow-token
     volumeMounts:
       - name: spark-metrics-config
         mountPath: /etc/spark-metrics
