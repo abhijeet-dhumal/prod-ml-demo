@@ -23,7 +23,7 @@ import platform
 import socket
 import time
 from contextlib import contextmanager
-from typing import Any, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 try:
     import mlflow
@@ -62,19 +62,23 @@ class SparkRunLogger:
         self.experiment = experiment
         self._run = None
         self._run_id = None
-        self._metrics: dict[str, Any] = {}
+        self._metrics: Dict[str, Any] = {}
         self._start_ts = time.time()
         self._enabled = MLFLOW_AVAILABLE and bool(os.environ.get("MLFLOW_TRACKING_URI"))
 
         if self._enabled:
-            mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
-            workspace = os.environ.get("MLFLOW_WORKSPACE")
-            if workspace and hasattr(mlflow, "set_workspace"):
-                try:
-                    mlflow.set_workspace(workspace)
-                except Exception:
-                    pass
-            mlflow.set_experiment(experiment)
+            try:
+                mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+                workspace = os.environ.get("MLFLOW_WORKSPACE")
+                if workspace and hasattr(mlflow, "set_workspace"):
+                    try:
+                        mlflow.set_workspace(workspace)
+                    except Exception:
+                        pass
+                mlflow.set_experiment(experiment)
+            except Exception as exc:
+                print(f"[MLflow] unreachable ({exc}); disabling tracking")
+                self._enabled = False
 
     @contextmanager
     def start_run(self, run_name: str = ""):
