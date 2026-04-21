@@ -133,21 +133,54 @@ oc get route grafana -n smartshop -o jsonpath='{.spec.host}'
 
 ---
 
-## Phase 4 — Feast Materialization
+## Phase 4 — Feast Materialization (Spark-backed)
 
-> **Goal:** Redis has materialized user and item features; `redis_db_keys > 0`.
-> **Requires:** Phase 3 feature Parquet files in MinIO.
+> **Goal:** Redis has materialized user and item features via `SparkComputeEngine`; `redis_db_keys > 0`.  
+> **Requires:** Phase 3 feature Parquet files in MinIO.  
+> **Architecture:** Feast pod runs a local PySpark session (`local[*]`), reads `SparkSource` → writes to Redis.  
+> **See:** `docs/FEAST-SPARK.md` for full architecture findings.  
 > **Blocker for:** Model training (rec model reads features from Feast).
+
+### 4a — Build feast-spark custom image
+
+> The default `feature-server:0.62.0` ships only `feast[minimal]` (no pyspark). We build a custom image  
+> with `pyspark==4.0.0` + `feast[spark]` + hadoop-aws JARs for `s3a://` MinIO access.
 
 | Status | # | Step | Command | Done when |
 |---|---|---|---|---|
-| 🔲 | 4.1 | Apply Feast RBAC | `oc apply -f infrastructure/feast/feast-spark-rbac.yaml` | `oc get role,rolebinding -n smartshop \| grep feast` |
-| 🔲 | 4.2 | Verify Feast pod is healthy | `oc get pod -n smartshop -l app=feast-smartshop-feast` | All containers Running |
-| 🔲 | 4.3 | Get Feast pod name | `FEAST_POD=$(oc get pod -n smartshop -l app=feast-smartshop-feast -o jsonpath='{.items[0].metadata.name}')` | — |
-| 🔲 | 4.4 | Run `feast apply` (register feature views) | `oc exec -n smartshop $FEAST_POD -c offline -- bash -c "cd /feast/feature_repo && feast apply"` | No errors |
-| 🔲 | 4.5 | Run `feast materialize-incremental` | `oc exec -n smartshop $FEAST_POD -c offline -- bash -c "cd /feast/feature_repo && feast materialize-incremental $(date -u +%Y-%m-%dT%H:%M:%S)"` | Logs show rows written to Redis |
-| 🔲 | 4.6 | Verify Redis has feature keys | `oc exec -n smartshop deploy/redis -- redis-cli -a smartshop-redis-2026 DBSIZE` | Count > 0 |
-| 🔲 | 4.7 | Check Redis ops in Grafana | Open Redis Feature Store dashboard | Keys visible, ops/sec non-zero |
+| 🔲 | 4.1 | Create `build/Containerfile.feast-spark` | See `docs/FEAST-SPARK.md` § "Custom feast-spark image" | File exists in repo |
+| 🔲 | 4.2 | Create `infrastructure/openshift/feast-spark-buildconfig.yaml` | See `docs/FEAST-SPARK.md` § "BuildConfig" | File exists in repo |
+| 🔲 | 4.3 | Apply ImageStream + BuildConfig | `oc apply -f infrastructure/openshift/feast-spark-buildconfig.yaml` | BC created |
+| 🔲 | 4.4 | Start build | `oc start-build feast-spark-server -n smartshop --follow` | Build `Complete` |
+
+### 4b — Update Feast feature repo for SparkSource
+
+> Switch `FileSource` (`s3://`) → `SparkSource` (`s3a://`) in `features.py` and update `feature_store.yaml`.  
+> No changes to ETL SparkApplication manifests — only the materialization layer changes.
+
+| Status | # | Step | Done when |
+|---|---|---|---|
+| 🔲 | 4.5 | Update `feast/feature_repo/features.py`: `FileSource` → `SparkSource`, `s3://` → `s3a://` | Import `SparkSource`, remove `s3_endpoint_override` |
+| 🔲 | 4.6 | Update `feast/feature_repo/feature_store.yaml`: `offline_store.type: file` → `type: spark` + s3a spark_conf | `type: spark` with `spark.hadoop.fs.s3a.*` keys |
+
+### 4c — Apply Feast Kubernetes config changes
+
+| Status | # | Step | Command | Done when |
+|---|---|---|---|---|
+| 🔲 | 4.7 | Create `feast-spark-engine` ConfigMap (SparkComputeEngine config) | `oc apply -f infrastructure/openshift/feast-spark-engine.yaml` | CM exists |
+| 🔲 | 4.8 | Create `feast-spark-config` Secret (SparkOfflineStore spark_conf) | `oc apply -f infrastructure/openshift/feast-spark-engine.yaml` | Secret exists |
+| 🔲 | 4.9 | Update FeatureStore CR: add `batchEngine`, switch `offlineStore.type: spark`, set custom image | `oc apply -f infrastructure/openshift/feast-operator.yaml` | Feast pod restarts with new image |
+| 🔲 | 4.10 | Wait for feast pod ready with new image | `oc rollout status deploy/smartshop-feast -n smartshop` | All containers Running |
+| 🔲 | 4.11 | Verify feast pod uses spark image | `oc get pod -l feast.dev/name=smartshop-feast -n smartshop -o jsonpath='{.items[0].spec.containers[*].image}'` | Shows `feast-spark-server:latest` |
+
+### 4d — Run feast apply + materialize
+
+| Status | # | Step | Command | Done when |
+|---|---|---|---|---|
+| 🔲 | 4.12 | `feast apply` (re-register SparkSource views) | `FEAST_POD=$(oc get pod -n smartshop -l feast.dev/name=smartshop-feast -o jsonpath='{.items[0].metadata.name}') && oc exec -n smartshop $FEAST_POD -c offline -- bash -c "cd /feast/feature_repo && feast apply"` | No errors; feature views registered |
+| 🔲 | 4.13 | `feast materialize-incremental` (SparkComputeEngine → Redis) | `oc exec -n smartshop $FEAST_POD -c offline -- bash -c "cd /feast/feature_repo && feast materialize-incremental $(date -u +%Y-%m-%dT%H:%M:%S)"` | Logs show Spark job + rows written to Redis |
+| 🔲 | 4.14 | Verify Redis has feature keys | `oc exec -n smartshop deploy/redis -- redis-cli -a smartshop-redis-2026 DBSIZE` | Count > 0 |
+| 🔲 | 4.15 | Check Redis ops in Grafana | Open Redis Feature Store dashboard | Keys visible, ops/sec non-zero |
 
 ---
 
@@ -224,11 +257,11 @@ oc get route grafana -n smartshop -o jsonpath='{.spec.host}'
 
 | Item | Reason | When to revisit |
 |---|---|---|
-| Feast `SparkOfflineStore` (pyspark) | RHOAI `odh-feature-server-rhel9` image missing `pyspark` | Custom Feast image build post-Summit |
-| Feast `SQLRegistry` (psycopg2) | Same image limitation | Same as above |
+| Feast `SQLRegistry` (psycopg2) | Default feast image has no psycopg2; upgrade to feast-spark image also fixes this | Phase 4 (use feast-spark image) |
+| Feast `SparkOfflineStore` k8s executor mode | `spark.master: k8s://...` requires executor pod RBAC + image with pyspark; `local[*]` used for Summit | Post-Summit scale-up |
 | OTEL distributed tracing (Gradio→KServe→Feast→Redis) | Needs OTEL Collector + Tempo backend | Post-Summit infra upgrade |
 | RAPIDS full dataset (571M reviews) | 49 GB download, ~4h ETL | Summit recording run (not demo) |
-| Embedding generation on GPU | `embedding_generation.py` uses sentence-transformers, runs on `spark-jobs` not `spark-jobs-rapids` | Separate GPU-enabled embedding job |
+| Embedding generation on GPU | `sentence-transformers==2.7.0` (Python 3.8 compatible) on `spark-jobs-rapids` image | build `spark-jobs-rapids-6` in progress |
 
 ---
 
@@ -281,3 +314,5 @@ python demo/app.py
 | 2026-04-20 | Phase 1 complete ✅ — user-workload monitoring, spark-metrics-config, redis_exporter, Grafana all deployed. PROMETHEUS_TOKEN saved. |
 | 2026-04-20 | Phase 2 complete ✅ (partial) — 1M reviews across 3 categories in MinIO. Only Electronics has metadata. Books/Home_and_Kitchen metadata missing from HF repo. Spark jobs will use metadata only for Electronics. |
 | 2026-04-20 | Issues found: (1) `datasets` lib missing from spark-jobs image — fixed by using `requests` streaming instead. (2) `smartshop-credentials` secret had empty MINIO/AWS creds — patched directly with `oc patch`. Tracked in IMPROVEMENTS.md. |
+| 2026-04-21 | Phase 3 partial ✅ — RAPIDS + CPU baseline SparkApps COMPLETED. `text-preprocessing` RUNNING. Build `spark-jobs-rapids-6` running (fix: sentence-transformers 2.7.0 for Python 3.8). |
+| 2026-04-21 | Phase 4 redesigned — switching from dask `FileSource` → `SparkComputeEngine` + `SparkSource`. ODH feast repo (`opendatahub-io/feast` v0.62.0) investigated: `spark` is a valid `offlineStore.type` in the CRD; `spec.batchEngine.configMapRef` injects `type: spark.engine` into feature_store.yaml; requires custom image with `pyspark==4.0.0 feast[spark]`. See `docs/FEAST-SPARK.md` for full findings. |

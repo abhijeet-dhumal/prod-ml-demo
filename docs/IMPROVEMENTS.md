@@ -96,8 +96,8 @@ Registry: `file` on NFS PVC. Online store: Redis.
 
 | Gap | Impact | Improvement |
 |---|---|---|
-| `odh-feature-server-rhel9` missing `pyspark` and `psycopg2` | Cannot use `SparkOfflineStore` or `SQLRegistry` — forces less scalable `dask` path | RHOAI should ship a **feature-server image variant** with optional extra packages, or support a `customImage` field in the FeatureStore CR |
-| No `SparkOfflineStore` support out of the box | For 100M+ feature rows, `dask` is slow and memory-heavy | Native `SparkOfflineStore` support in RHOAI Feast image is a blocker for production scale |
+| `feature-server:0.62.0` ships only `feast[minimal]` (no `pyspark`, no `psycopg2`) | Cannot use `SparkOfflineStore`, `SparkComputeEngine`, or `SQLRegistry` without a custom image | RHOAI should ship a **feature-server image variant** with optional extras, or support a `services.*.server.image` override in the FeatureStore CR — **the CR already supports this field** (workaround available) |
+| `feast[spark]` requires `pyspark>=4.0.0` (major version jump from 3.5.x ETL) | Feast's internal SparkSession version is independent of ETL Spark Operator version — no conflict, but `pyspark==4.0.0` must be installed in the feast image | Custom `Containerfile.feast-spark` needed (see `docs/FEAST-SPARK.md`) |
 | `feast materialize` is manual and not scheduled | Features go stale unless someone remembers to run the command | RHOAI should provide a **CronJob-based materialization schedule** configurable in the FeatureStore CR (e.g., `materializationSchedule: "0 * * * *"`) |
 | NFS double-mount problem with `smartshop-shared-storage` | Feast registry PVC must be a separate PVC; sharing NFS PVC in the same pod fails | Document this as a known NFS CSI limitation; recommend dedicated PVC per Feast component |
 | No built-in feature drift detection | Feature schema changes break downstream models silently | Integrate Great Expectations or Evidently AI for schema validation on `feast apply` |
@@ -253,87 +253,79 @@ by the platform team** before data scientists begin:
 
 ---
 
-## Post-Summit Upgrade: SparkOfflineStore + SparkSource
+## Phase 4 Upgrade: SparkComputeEngine + SparkOfflineStore
 
 Per the [Feast Production Deployment Topologies](https://github.com/ntkathole/feast/blob/prod_deploy/docs/how-to-guides/production-deployment-topologies.md) guide, the recommended stack for OpenShift / on-prem at >100M rows is:
 
 > **Offline Store: Spark + MinIO · Compute Engine: Spark**
 
-### Current state (Summit demo)
+**Full architecture findings documented in:** `docs/FEAST-SPARK.md`
+
+### Corrected understanding of SparkComputeEngine
+
+`SparkComputeEngine` does **NOT** submit `SparkApplication` CRDs to the Spark Operator. It runs PySpark **in-process inside the feast server pod** using a local `SparkSession`. The ETL `SparkApplication` manifests are completely separate and unchanged.
 
 ```
-SparkApplication (RHOAI Spark Operator) → Parquet on MinIO
-  ↓
-Feast FileSource + dask offline store → Redis (1.7 GiB, works fine for demo)
+ETL (unchanged):
+  SparkApplication (RHOAI Spark Operator) → Parquet on MinIO (s3a://)
+
+Materialization (upgraded):
+  feast materialize-incremental
+    → SparkSession starts inside feast pod (spark.master: local[*])
+    → SparkSource reads s3a://smartshop-features/*.parquet via hadoop-aws
+    → mapInPandas writes to Redis
 ```
 
-This pattern is valid but Feast doesn't control the Spark jobs — we manage SparkApplications manually.
+With `spark.master: k8s://...` (production mode), the feast pod becomes the Spark driver and k8s spawns executor pods — but this requires executor RBAC + matching pyspark image. For the demo, `local[*]` is sufficient (1.7 GiB materialization data).
 
-### Ideal state (post-Summit)
+### Current state (pre-upgrade)
 
 ```
-Feast materialize-incremental
-  → submits SparkJob via SparkOfflineStore
-  → SparkSource reads Parquet from MinIO
-  → writes to Redis
+Feast FileSource + dask offline store → Redis
+  protocol: s3:// (pyarrow/fsspec)
+  image: quay.io/feastdev/feature-server:0.62.0 (feast[minimal], no pyspark)
 ```
 
-Feast owns the full materialize lifecycle. `feast materialize-incremental` triggers a SparkApplication automatically.
+### Target state (Phase 4)
 
-### What needs to change
-
-**1. Custom feast image with pyspark:**
-```dockerfile
-FROM quay.io/opendatahub/opendatahub-feast:latest
-USER 0
-RUN pip install pyspark==3.5.3 feast[spark]
-USER 1001
+```
+Feast SparkSource + SparkComputeEngine → Redis
+  protocol: s3a:// (hadoop-aws 3.4.0 JAR)
+  image: image-registry.../smartshop/feast-spark-server:latest
+         (feature-server:0.62.0 + pyspark==4.0.0 + feast[spark])
+  spark.master: local[*]
 ```
 
-**2. `feature_store.yaml` — swap to SparkOfflineStore:**
+### Key FeatureStore CR changes
+
 ```yaml
-offline_store:
-  type: spark
-  spark_conf:
-    spark.master: "k8s://https://kubernetes.default.svc"
-    spark.submit.deployMode: cluster
-    spark.kubernetes.namespace: smartshop
-    spark.kubernetes.container.image: quay.io/abdhumal/smartshop-spark-jobs-rapids:latest
-    spark.hadoop.fs.s3a.endpoint: "http://minio.smartshop.svc.cluster.local:9000"
-    spark.hadoop.fs.s3a.path.style.access: "true"
-    spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+spec:
+  batchEngine:
+    configMapRef:
+      name: feast-spark-engine   # type: spark.engine + spark_conf
+  services:
+    offlineStore:
+      persistence:
+        store:
+          type: spark            # was: file (dask)
+          secretRef:
+            name: feast-spark-config
+      server:
+        image: image-registry.openshift-image-registry.svc:5000/smartshop/feast-spark-server:latest
 ```
 
-**3. `features.py` — swap `FileSource` → `SparkSource`:**
-```python
-from feast.infra.offline_stores.contrib.spark_offline_store.spark_source import SparkSource
+### pyspark version constraint
 
-user_features_source = SparkSource(
-    path="s3a://smartshop-features/user_features/",
-    file_format="parquet",
-    timestamp_field="event_timestamp",
-)
-```
-
-**4. FeatureStore CR — set custom image + disable init containers:**
-```yaml
-services:
-  offlineStore:
-    persistence:
-      file:
-        type: spark
-    server:
-      image: quay.io/abdhumal/smartshop-feast-spark:latest
-```
+`feast[spark]==0.62.0` requires `pyspark>=4.0.0`. The base image is Python 3.12 (compatible). PySpark 4.0 uses Hadoop 3.4.x — use `hadoop-aws-3.4.0.jar` + `aws-java-sdk-bundle-1.12.367.jar` for `s3a://`.
 
 ### Why this matters for scale
 
-| Scale | Current (dask) | Ideal (Spark) |
-|-------|---------------|---------------|
-| 1.7 GiB feature Parquet | ✅ works | ✅ works |
-| 112 GiB full features | ⚠️ likely OOM | ✅ distributed |
-| 571M row full dataset | ❌ not viable | ✅ designed for this |
-| Scheduled materialization | Manual CronJob | `feast materialize-incremental` |
+| Scale | Current (dask) | Upgraded (Spark local[*]) | Production (Spark k8s//) |
+|-------|---------------|--------------------------|--------------------------|
+| 1.7 GiB feature Parquet | ✅ works | ✅ works | ✅ works |
+| 50 GiB feature views | ⚠️ likely OOM | ⚠️ OOM (single pod) | ✅ distributed executors |
+| 571M row full dataset | ❌ not viable | ❌ not viable | ✅ designed for this |
+| Native Feast SQL registry | ❌ no psycopg2 | ✅ custom image has it | ✅ |
 
 ---
 
