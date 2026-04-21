@@ -152,8 +152,12 @@ All on branch [`refine-cluster-infra-setup`](https://github.com/abhijeet-dhumal/
 
 | Screenshot | File | What it shows | Status |
 |-----------|------|--------------|--------|
-| RAPIDS job mid-run — GPU memory 75 GB loaded | `Screenshot_2026-04-21_at_8.55.26_PM-4ebf164d.png` | Framebuffer at 75 GB, SM active, power at 80–100W during I/O-bound ETL | ✅ captured |
-| RAPIDS job completed — GPU memory released to 0 | `Screenshot_2026-04-21_at_8.58.54_PM-dbf36a38.png` | Memory drops to 0 at 20:55 (job completion), DRAM spike on final flush | ✅ captured |
+| RAPIDS run — all 6 GPU metrics | `grafana-gpu-all-metrics-during-run.png` | Full dashboard: util, framebuffer, SM active, DRAM, NVLink, power | ✅ captured |
+| RAPIDS run — early GPU activity (19:20–20:15) | `grafana-gpu-activity-early-run.png` | SM active spikes during feature aggregation phase | ✅ captured |
+| RAPIDS job mid-run — GPU memory spike | `grafana-gpu-memory-midrun-spike.png` | Framebuffer at 75 GB at ~20:50, power 80–100W | ✅ captured |
+| RAPIDS job mid-run — 75 GB loaded (PNG ref) | `grafana-rapids-midrun-gpu-memory-75gb.png` | Framebuffer at 75 GB, SM active, power at 80–100W during I/O-bound ETL | ✅ captured |
+| RAPIDS job — complete run full timeline | `grafana-gpu-complete-run-timeline.png` | Full arc: memory spike → job completes → memory released (best overview) | ✅ captured |
+| RAPIDS job completed — memory released to 0 | `grafana-rapids-completed-gpu-memory-released.png` | Memory drops to 0 at 20:55 (job completion), DRAM spike on final flush | ✅ captured |
 | NVLink Bandwidth during TrainJob | — | Inter-GPU comms during DDP/FSDP training | 🔲 pending |
 | Redis ops/s during Feast materialize | — | Write throughput as features land in online store | 🔲 pending |
 
@@ -172,6 +176,29 @@ All on branch [`refine-cluster-infra-setup`](https://github.com/abhijeet-dhumal/
 oc get secret grafana-admin-credentials -n smartshop \
   -o jsonpath='{.data.GF_SECURITY_ADMIN_PASSWORD}' | base64 -d
 ```
+
+### OpenShift / Cluster State
+
+| Screenshot | File | What it shows | Status |
+|-----------|------|--------------|--------|
+| 3 SparkApps running simultaneously | `openshift-3-sparkapps-running.png` | cpu-baseline + rapids + text-preprocessing all RUNNING in parallel | ✅ captured |
+| Full smartshop pod stack | `openshift-full-stack-pods-running.png` | feast, grafana, milvus, postgres, redis, redsinsight all Running | ✅ captured |
+| Spark executor pods with memory | `openshift-spark-executor-pods.png` | ~12 GB/executor, 4 executors each for rapids + cpu-baseline | ✅ captured |
+| Pods view incl. Spark History Server | `openshift-pods-with-history-server.png` | history server + driver pods + completed build pods | ✅ captured |
+| RAPIDS driver pod running | `openshift-rapids-driver-running.png` | rapids driver Running + build pods Completed | ✅ captured |
+
+### Spark History Server
+
+| Screenshot | File | What it shows | Status |
+|-----------|------|--------------|--------|
+| Both runs completed | `spark-history-both-runs-completed.png` | CPU baseline 2.0h + RAPIDS 1.3h side-by-side — best speedup evidence | ✅ captured |
+| RAPIDS job completed (1h 3m) | `spark-history-rapids-completed-1h3m.png` | Single job view with event log download link | ✅ captured |
+
+### MinIO Data
+
+| Screenshot | File | What it shows | Status |
+|-----------|------|--------------|--------|
+| Raw data loaded in MinIO | `minio-raw-data-loaded.png` | smartshop-raw bucket: Books/Electronics/Home_and_Kitchen parquet files (32.8 GiB, 300 objects) | ✅ captured |
 
 ### MLflow UI
 

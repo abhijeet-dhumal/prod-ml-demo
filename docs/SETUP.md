@@ -566,6 +566,10 @@ After MinIO, Redis, and Milvus are up, all four core pods should be running in `
 
 ![smartshop namespace pods — milvus-etcd, milvus-standalone, minio, redis all Running](./assets/05-smartshop-pods-running.png)
 
+Once the full demo stack is deployed (including Feast, Grafana, and the Spark History Server), the complete pod list looks like this:
+
+![Full smartshop stack — feast, grafana, milvus, postgres, redis, redsinsight all Running](./assets/openshift-full-stack-pods-running.png)
+
 ---
 
 ## 8. Deploy Feast Feature Store
@@ -1100,6 +1104,10 @@ AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" 
   aws s3 ls s3://smartshop-raw/raw/reviews/ --endpoint-url $S3 --no-verify-ssl
 ```
 
+**Verify data landed in MinIO:**
+
+![MinIO smartshop-raw bucket with reviews parquet files loaded](./assets/minio-raw-data-loaded.png)
+
 To run full dataset (49GB) for the Summit recording, patch the Job's env before apply:
 
 ```bash
@@ -1171,10 +1179,45 @@ oc get sparkapplication -n smartshop
 oc logs -n smartshop -f $(oc get pod -n smartshop -l spark-role=driver -o name | head -1)
 ```
 
+When running both CPU baseline and RAPIDS simultaneously, you'll see all three SparkApplications in the console:
+
+![OpenShift console showing cpu-baseline, rapids, and text-preprocessing SparkApplications all RUNNING](./assets/openshift-3-sparkapps-running.png)
+
+Executor pods spin up per job — each gets ~12 GB RAM and the RAPIDS driver gets a GPU:
+
+![Executor pods for rapids and cpu-baseline running with 12 GB memory each](./assets/openshift-spark-executor-pods.png)
+
 When the job completes, the following MinIO buckets will be populated with Parquet files:
 - `s3://smartshop-features/user_features/`
 - `s3://smartshop-features/item_features/`
 - `s3://smartshop-embeddings/review_embeddings/`
+
+**Grafana — GPU utilization during the RAPIDS run:**
+
+The SmartShop GPU Performance dashboard shows real GPU activity throughout the job lifecycle:
+
+![Grafana — all 6 DCGM panels during the RAPIDS run (utilization, framebuffer, SM active, DRAM, NVLink, power)](./assets/grafana-gpu-all-metrics-during-run.png)
+
+Key observations to highlight during the demo:
+- **Framebuffer** holds ~75 GB continuously — the full dataset stays in GPU VRAM between stages
+- **SM Active peaks** visible during user feature aggregation (~20:20) — the most compute-heavy stage
+- **GPU power** 80–100 W (vs 400 W TDP) — workload is I/O-bound waiting on MinIO reads
+
+Mid-run GPU memory spike:
+
+![Grafana — framebuffer memory spike to 75 GB at mid-run](./assets/grafana-gpu-memory-midrun-spike.png)
+
+Full run arc — memory rises, job completes, GPU released:
+
+![Grafana — complete run timeline showing memory rise then drop to 0 at job completion](./assets/grafana-gpu-complete-run-timeline.png)
+
+**Spark History Server — completed runs:**
+
+Both completed runs are visible in the History Server at `https://spark-history-smartshop.apps.oai-kft-ibm.ibm.rh-ods.com`:
+
+![Spark History Server showing CPU baseline 2.0h and RAPIDS 1.3h runs side by side](./assets/spark-history-both-runs-completed.png)
+
+The RAPIDS run completes in 1h 3m vs 2h for CPU baseline — **1.48× wall-clock speedup**.
 
 ### Materialize features into Redis (online store)
 
