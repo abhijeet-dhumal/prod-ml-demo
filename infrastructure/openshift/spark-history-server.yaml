@@ -8,13 +8,11 @@
 # Demo value: side-by-side with Ray Dashboard — shows Spark ETL job internals
 # (CPU baseline vs RAPIDS GPU) with stage timelines and executor utilization.
 #
-# SparkApplications write per-job logs to:
-#   s3a://smartshop-spark-logs/rapids/
-#   s3a://smartshop-spark-logs/cpu-baseline/
-#   s3a://smartshop-spark-logs/text-preprocessing/
-#   s3a://smartshop-spark-logs/embedding/
+# SparkApplications write event logs flat into the bucket root:
+#   s3a://smartshop-spark-logs/spark-<appId>.zstd
 #
-# History Server scans all subdirs via spark.history.fs.logDirectory=s3a://smartshop-spark-logs
+# NOTE: History Server does NOT recurse into subdirectories.
+# All SparkApplications must use spark.eventLog.dir=s3a://smartshop-spark-logs/
 #
 # Route: https://spark-history-smartshop.apps.oai-kft-ibm.ibm.rh-ods.com/
 #
@@ -59,7 +57,7 @@ spec:
 
               # Write conf with no leading whitespace (heredoc indentation stripped via printf)
               printf '%s\n' \
-                "spark.history.fs.logDirectory s3a://smartshop-spark-logs/" \
+                "spark.history.fs.logDirectory s3a://smartshop-spark-logs/events" \
                 "spark.history.fs.update.interval 10s" \
                 "spark.history.ui.port 18080" \
                 "spark.history.retainedApplications 100" \

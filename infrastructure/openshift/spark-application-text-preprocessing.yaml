@@ -41,6 +41,7 @@ spec:
     fs.s3a.path.style.access: "true"
     fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
     fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+    fs.s3a.metadatastore.impl: "org.apache.hadoop.fs.s3a.s3guard.NullMetadataStore"
   sparkConf:
     spark.sql.adaptive.enabled: "true"
     spark.sql.shuffle.partitions: "400"
@@ -50,9 +51,8 @@ spec:
     spark.metrics.conf: "/etc/spark-metrics/metrics.properties"
     # Spark History Server — event logs written to MinIO s3a://
     spark.eventLog.enabled: "true"
-    spark.eventLog.dir: "s3a://smartshop-spark-logs/text-preprocessing"
+    spark.eventLog.dir: "s3a://smartshop-spark-logs/events"
     spark.eventLog.compress: "true"
-    spark.history.fs.logDirectory: "s3a://smartshop-spark-logs/text-preprocessing"
     # Large shuffle for dedup (dropDuplicates across 109M rows)
     spark.sql.shuffle.partitions: "600"
   driver:

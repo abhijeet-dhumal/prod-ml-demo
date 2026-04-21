@@ -43,6 +43,7 @@ spec:
     fs.s3a.path.style.access: "true"
     fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
     fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+    fs.s3a.metadatastore.impl: "org.apache.hadoop.fs.s3a.s3guard.NullMetadataStore"
   sparkConf:
     spark.sql.adaptive.enabled: "true"
     spark.sql.shuffle.partitions: "200"
@@ -52,9 +53,8 @@ spec:
     spark.metrics.conf: "/etc/spark-metrics/metrics.properties"
     # Spark History Server — event logs written to MinIO s3a://
     spark.eventLog.enabled: "true"
-    spark.eventLog.dir: "s3a://smartshop-spark-logs/embedding"
+    spark.eventLog.dir: "s3a://smartshop-spark-logs/events"
     spark.eventLog.compress: "true"
-    spark.history.fs.logDirectory: "s3a://smartshop-spark-logs/embedding"
     # Transformers model download cache → /tmp (work-dir not writable by uid 1001 without rebuild)
     spark.executorEnv.TRANSFORMERS_CACHE: "/tmp/hf-cache"
     spark.executorEnv.HF_HOME: "/tmp/hf-home"

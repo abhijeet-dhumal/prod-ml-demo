@@ -55,6 +55,7 @@ spec:
     # EnvironmentVariableCredentialsProvider was removed in hadoop-aws 3.3.x;
     # use the AWS SDK class directly (reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from env)
     fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+    fs.s3a.metadatastore.impl: "org.apache.hadoop.fs.s3a.s3guard.NullMetadataStore"
   sparkConf:
     spark.sql.adaptive.enabled: "true"
     spark.sql.shuffle.partitions: "200"
@@ -68,9 +69,8 @@ spec:
     spark.metrics.conf: "/etc/spark-metrics/metrics.properties"
     # Spark History Server — event logs written to MinIO s3a://
     spark.eventLog.enabled: "true"
-    spark.eventLog.dir: "s3a://smartshop-spark-logs/cpu-baseline"
+    spark.eventLog.dir: "s3a://smartshop-spark-logs/events"
     spark.eventLog.compress: "true"
-    spark.history.fs.logDirectory: "s3a://smartshop-spark-logs/cpu-baseline"
   driver:
     cores: ${SPARK_DRIVER_CORES:-2}
     memory: "${SPARK_DRIVER_MEMORY:-4g}"
