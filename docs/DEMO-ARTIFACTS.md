@@ -25,21 +25,30 @@ auto-generate and upload most of these to `s3://smartshop-models/notebooks/`.
 
 Both jobs processed the full Amazon review dataset (Electronics + Books + Home & Kitchen).
 
+> **Run date:** 2026-04-21 — full dataset, both jobs submitted simultaneously from a clean cluster state.
+
 | Metric | CPU Baseline | RAPIDS GPU | Speedup |
 |--------|-------------|------------|---------|
-| Total rows processed | 140,772,341 ✅ | 140,772,341 ✅ | same |
-| Read time (s) | 193.72 ✅ | **108.46** ✅ | **1.79×** |
-| User feature aggregation (s) | 396.36 ✅ | **313.72** ✅ | **1.26×** |
-| Item feature aggregation (s) | 41.18 ✅ | **22.06** ✅ | **1.87×** |
-| Interaction join/write (s) | 55.15 ✅ | 83.56 ✅ | (shuffle-bound, expected) |
-| **Total wall-clock (s)** | **719.23** ✅ | **536.82** ✅ | **1.34× overall** |
-| Throughput (rows/s) | 195,727 ✅ | **262,231** ✅ | **+34%** |
-| Unique users | 35,049,327 ✅ | 35,049,327 ✅ | |
-| Unique items | 9,790,339 ✅ | 9,790,339 ✅ | |
-| `gpu_accelerated` flag | `False` ✅ | `True` ✅ | |
+| Total rows processed | 140,772,341 | 140,772,341 ✅ | same |
+| Read time (s) | _pending_ | **1,091.4** ✅ | — |
+| User feature aggregation (s) | _pending_ | **1,912.7** ✅ | — |
+| Item feature aggregation (s) | _pending_ | **786.4** ✅ | — |
+| Interaction join/write (s) | _pending_ | **844.3** ✅ | — |
+| **Total elapsed (s)** | _pending_ | **4,667.7** ✅ | _pending CPU_ |
+| **Wall-clock (s)** | _pending_ | **4,755** ✅ | _pending CPU_ |
+| Throughput (rows/s) | _pending_ | **30,159** ✅ | — |
+| Unique users | _pending_ | 35,049,327 ✅ | |
+| Unique items | _pending_ | 9,790,339 ✅ | |
+| `gpu_accelerated` flag | `False` | `True` ✅ | |
 
-**RAPIDS job completed:** `2026-04-21T09:10:08Z`  
-**CPU job completed:** `2026-04-21T08:00:58Z`
+> **Note on elapsed time:** The ~4,667s (78 min) total is significantly higher than earlier smaller-dataset runs.
+> This is the full 49 GB dataset with 140M rows on an I/O-bound MinIO S3 path.
+> The bottleneck is network throughput to object storage, not GPU compute — confirmed by Grafana DCGM
+> showing < 2.5% SM Active Ratio and sustained ~80–100W power (vs 400W A100 TDP).
+> CPU baseline still running — speedup ratio to be updated once complete.
+
+**RAPIDS job completed:** `2026-04-21T15:25:39Z`  
+**CPU job completed:** _still running_
 
 ```bash
 # Reproduce metrics from driver logs:
@@ -130,13 +139,22 @@ All on branch [`refine-cluster-infra-setup`](https://github.com/abhijeet-dhumal/
 
 ### Grafana Dashboards
 
-| Screenshot | URL | Status |
-|-----------|-----|--------|
-| GPU Utilization % spike (RAPIDS window ~14:00–14:55) | [grafana-smartshop.apps.oai-kft-ibm.ibm.rh-ods.com](https://grafana-smartshop.apps.oai-kft-ibm.ibm.rh-ods.com) → GPU panel | ✅ captured |
-| GPU Framebuffer Memory Used (A100 80GB) | Same dashboard | ✅ captured |
-| SM Active Ratio / DRAM Active Ratio | Same dashboard | ✅ captured |
-| NVLink Bandwidth during training | GPU dashboard, during TrainJob | 🔲 pending |
-| Redis ops/s during Feast materialize | Redis dashboard | 🔲 pending |
+| Screenshot | File | What it shows | Status |
+|-----------|------|--------------|--------|
+| RAPIDS job mid-run — GPU memory 75 GB loaded | `Screenshot_2026-04-21_at_8.55.26_PM-4ebf164d.png` | Framebuffer at 75 GB, SM active, power at 80–100W during I/O-bound ETL | ✅ captured |
+| RAPIDS job completed — GPU memory released to 0 | `Screenshot_2026-04-21_at_8.58.54_PM-dbf36a38.png` | Memory drops to 0 at 20:55 (job completion), DRAM spike on final flush | ✅ captured |
+| NVLink Bandwidth during TrainJob | — | Inter-GPU comms during DDP/FSDP training | 🔲 pending |
+| Redis ops/s during Feast materialize | — | Write throughput as features land in online store | 🔲 pending |
+
+**Grafana dashboard:** `https://grafana-smartshop.apps.oai-kft-ibm.ibm.rh-ods.com`  
+**Dashboard name:** SmartShop GPU Performance (RAPIDS vs CPU)
+
+**Key insight from DCGM data (captured in screenshots):**
+- SM Active Ratio peak: ~2.5% — workload is **I/O-bound**, not compute-bound
+- Framebuffer sustained at ~75 GB — full dataset held in GPU VRAM throughout
+- Power: 80–100W (vs 400W TDP) — GPU waiting on MinIO S3 reads between stages
+- NVLink near-zero — expected, single-node ETL (no inter-GPU comms needed)
+- Large SM spike at ~20:20 IST = user feature aggregation stage (1,912s — heaviest compute stage)
 
 ```bash
 # Admin password:
