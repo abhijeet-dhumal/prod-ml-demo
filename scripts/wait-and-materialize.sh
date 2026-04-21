@@ -21,6 +21,7 @@ APPS=(
   "smartshop-feature-engineering-rapids"
   "smartshop-feature-engineering-cpu-baseline"
   "smartshop-text-preprocessing"
+  "smartshop-embedding-generation"
 )
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }

@@ -175,7 +175,9 @@ phase_data() {
   # Full dataset download (HuggingFace → MinIO sharded parquet)
   apply "$REPO_ROOT/infrastructure/openshift/data-download-job.yaml"
   ok "data-download job submitted"
-  echo "  Wait: oc logs -n $NAMESPACE job/smartshop-data-download-full -f"
+  # Job name comes from the YAML metadata.name field
+  JOB_NAME=$(grep 'name: smartshop-data-download' "$REPO_ROOT/infrastructure/openshift/data-download-job.yaml" | awk '{print $2}' | head -1)
+  echo "  Wait: oc logs -n $NAMESPACE job/${JOB_NAME} -f"
 }
 
 # ── Phase: observability ──────────────────────────────────────────────────────

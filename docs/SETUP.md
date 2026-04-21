@@ -624,7 +624,7 @@ envsubst < infrastructure/openshift/feast-operator.yaml | oc apply -f -
 The CR:
 - Sets `spec.batchEngine.configMapRef: feast-spark-engine` — `SparkComputeEngine`
 - Sets `offlineStore.persistence.store.type: spark` — `SparkOfflineStore`
-- Sets `services.disableInitContainers: true` — init containers disabled (feast[minimal] init image lacks pyspark; we run `feast apply` manually)
+- Uses custom `feast-spark-server` image for all containers — includes pyspark + Hadoop-AWS JARs required by SparkOfflineStore
 - Overrides all service images to `feast-spark-server:latest`
 - Online store: Redis via `feast-redis-secret`
 - Registry: file-backed PVC (1Gi `nfs-csi`)
@@ -654,60 +654,9 @@ oc exec -n smartshop deploy/feast-smartshop-feast -c offline -- python3 -c "impo
 # 4.0.0
 ```
 
-### 8d — Enable Feature Store in RHOAI Dashboard
+> ↓ See **§8b** below for the Feature Store dashboard enable step.
 
-The Feature Store tab defaults to **disabled**. Patch it once per cluster:
-
-```bash
-oc patch odhdashboardconfig odh-dashboard-config \
-  -n redhat-ods-applications \
-  --type=merge \
-  -p '{"spec":{"dashboardConfig":{"disableFeatureStore":false}}}'
-
-oc rollout restart deployment/rhods-dashboard -n redhat-ods-applications
-oc rollout status deployment/rhods-dashboard -n redhat-ods-applications
-```
-
-The FeatureStore CR has `label: feature-store-ui: enabled`. Verify:
-```bash
-oc get featurestore smartshop-feast -n smartshop \
-  -o jsonpath='{.metadata.labels.feature-store-ui}'
-# enabled
-```
-
-### 8e — Run `feast apply` (register schema)
-
-Because `disableInitContainers: true` is set, `feast apply` must be run manually after the pod starts. This requires the Spark ETL to have written Parquet already (or placeholder files — see note below):
-
-```bash
-FEAST_POD=$(oc get pod -n smartshop -l feast.dev/name=smartshop-feast \
-  -o jsonpath='{.items[0].metadata.name}')
-
-# Clone the repo inside the pod, then feast apply
-oc exec -n smartshop $FEAST_POD -c offline -- bash -c "
-  git clone -b feat/phase3-complete-rapids-docs-mlflow \
-    https://github.com/abhijeet-dhumal/prod-ml-demo.git /tmp/smartshop-repo &&
-  cd /tmp/smartshop-repo/feast/feature_repo &&
-  FEAST_REGISTRY_TYPE=file FEAST_REGISTRY_PATH=/feast-registry/registry.db \
-  feast apply
-"
-
-# Expected output:
-# Applying changes for project smartshop
-# Deploying infrastructure for user_features (SparkSource)
-# Deploying infrastructure for item_features (SparkSource)
-# Deploying infrastructure for review_embeddings (SparkSource)
-```
-
-> **SparkSource schema inference:** Unlike `FileSource` (which uses PyArrow to read schema),
-> `SparkSource` with `local[*]` starts a SparkSession to infer schema from the Parquet files.
-> The files must exist in MinIO before `feast apply` succeeds.
-> Run Phase 3 (Spark ETL) first, or write placeholder Parquet files (see note below).
-
-> **Placeholder files (if ETL not yet run):** Write 0-row Parquet files with the correct
-> schema to MinIO so SparkSource schema inference succeeds without real data. Use the
-> placeholder script from the old SETUP.md or run a small `spark.createDataFrame([], schema)`
-> inside the feast pod.
+> ↓ See **§8c** below for the canonical `feast apply` step.
 
 ### 8f — `feast materialize-incremental` (SparkComputeEngine → Redis)
 
@@ -834,11 +783,11 @@ After the dashboard restarts, the **Feature Store** section appears in the RHOAI
 
 ```bash
 # Run inside the Feast offline container
-FEAST_POD=$(oc get pod -n smartshop -l app=feast-smartshop-feast \
+FEAST_POD=$(oc get pod -n smartshop -l feast.dev/name=smartshop-feast \
   -o jsonpath='{.items[0].metadata.name}')
 
-oc exec -n smartshop $FEAST_POD -c offline -- \
-  bash -c "cd /feast-data/smartshop/feast/feature_repo && feast apply"
+oc exec -n smartshop $FEAST_POD -c registry -- \
+  feast -c /feast-data/smartshop/feature_repo apply
 
 # Expected output:
 # Applying changes for project smartshop
@@ -1219,7 +1168,7 @@ oc exec -n smartshop $FEAST_POD -c offline -- \
 > **Prerequisite:** Feast must be materialized (step 11d) before training reads online features.
 > All trainer images are already built and pushed to quay.io ✅.
 
-### 11a — Recommendation Model (DDP, 4 GPUs, 1 node)
+### 12a — Recommendation Model (DDP, 4 GPUs, 1 node)
 
 ```bash
 # hf-credentials secret is already created by `make setup-secrets` (key: token)
@@ -1233,7 +1182,7 @@ oc apply -f infrastructure/openshift/trainjobs.yaml
 oc get trainjob smartshop-rec-train -n smartshop -w
 ```
 
-### 11b — LLM Fine-tuning (FSDP, 8 GPUs, 2 nodes via Slurm)
+### 12b — LLM Fine-tuning (FSDP, 8 GPUs, 2 nodes via Slurm)
 
 The FSDP job dispatches to Slurm for NVLink-aware gang scheduling. Before submitting, scale the Slurm workers up from 0:
 

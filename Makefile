@@ -155,10 +155,12 @@ setup-builds: ## Create ImageStreams and BuildConfigs on the cluster
 	envsubst < infrastructure/openshift/buildconfigs.yaml  | $(KUBECTL) apply -f -
 
 build-images: ## Trigger all image builds on the cluster (requires setup-builds first)
-	$(KUBECTL) start-build spark-jobs   -n $(NAMESPACE) --follow
-	$(KUBECTL) start-build rec-trainer  -n $(NAMESPACE) --follow
-	$(KUBECTL) start-build llm-trainer  -n $(NAMESPACE) --follow
-	$(KUBECTL) start-build rec-server   -n $(NAMESPACE) --follow
+	$(KUBECTL) start-build spark-jobs         -n $(NAMESPACE) --follow
+	$(KUBECTL) start-build spark-jobs-rapids  -n $(NAMESPACE) --follow
+	$(KUBECTL) start-build feast-spark-server -n $(NAMESPACE) --follow
+	$(KUBECTL) start-build rec-trainer        -n $(NAMESPACE) --follow
+	$(KUBECTL) start-build llm-trainer        -n $(NAMESPACE) --follow
+	$(KUBECTL) start-build rec-server         -n $(NAMESPACE) --follow
 
 build-spark:     ## Build only spark-jobs image
 	$(KUBECTL) start-build spark-jobs  -n $(NAMESPACE) --follow
@@ -210,7 +212,8 @@ setup-secrets: ## Create/update all Kubernetes secrets from .env values
 	envsubst < infrastructure/smartshop/credentials.yaml  | $(KUBECTL) apply -f -
 	envsubst < infrastructure/redis/redis.yaml             | $(KUBECTL) apply -f - --prune=false
 	envsubst < infrastructure/mlflow/postgres.yaml        | $(KUBECTL) apply -f -
-	envsubst < infrastructure/feast/feast-operator.yaml   | $(KUBECTL) apply -f -
+	# NOTE: Feast FeatureStore CR (Spark backend) is applied by scripts/apply-all.sh phase_feast
+	# Do NOT apply infrastructure/feast/feast-operator.yaml (dask backend, superseded)
 	@echo "==> redhat-ods-applications secrets..."
 	$(KUBECTL) create secret generic mlflow-s3-credentials \
 	  --from-literal=AWS_ACCESS_KEY_ID=$(MINIO_ACCESS_KEY) \

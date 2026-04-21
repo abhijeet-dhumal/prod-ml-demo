@@ -38,7 +38,7 @@ flowchart TD
 
     %% ── Feast Feature Store ───────────────────────────────────────────────
     subgraph FEAST_NS["🍽️  Feast Feature Store  ·  smartshop namespace"]
-        FEAST_OFF["Offline Store\ndask · reads Parquet\nfrom MinIO S3"]
+        FEAST_OFF["Offline Store\nSpark · SparkOfflineStore\nlocal[*] · reads Parquet from MinIO S3"]
         FEAST_REG["Registry\nfeature definitions\n1 Gi NFS PVC"]
         FEAST_ON["Online Store\nRedis 7\npassword auth"]
         FEAST_VEC["Vector Store\nMilvus standalone\n50 Gi NFS"]
