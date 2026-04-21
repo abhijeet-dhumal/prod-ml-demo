@@ -37,7 +37,12 @@ offline_store:
     spark.sql.session.timeZone: "UTC"
     spark.sql.execution.arrow.pyspark.enabled: "true"
     spark.sql.execution.arrow.fallback.enabled: "true"
-    spark.sql.shuffle.partitions: "8"
+    # 200 partitions for 35M users / 9.8M items — avoids OOM on large shuffles
+    spark.sql.shuffle.partitions: "200"
+    spark.default.parallelism: "200"
+    spark.driver.memory: "8g"
+    spark.executor.memory: "8g"
+    spark.sql.execution.arrow.maxRecordsPerBatch: "50000"
     # s3a MinIO access — credentials from EnvironmentVariableCredentialsProvider
     # (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY from feast-s3-credentials secret)
     spark.hadoop.fs.s3a.endpoint: "${AWS_ENDPOINT_URL_S3:-http://minio.smartshop.svc.cluster.local:9000}"
@@ -45,9 +50,49 @@ offline_store:
     spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
     spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
     spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+    spark.hadoop.fs.s3a.connection.maximum: "100"
+    spark.hadoop.fs.s3a.threads.max: "64"
   # staging_location: write large materializations to S3 staging before Redis write
   # auto-converts s3:// → s3a:// internally
   staging_location: "s3://smartshop-features/feast-staging/"
+
+# batch_engine: controls how feast materialize-incremental writes to the online store.
+# SparkComputeEngine runs a SparkSession local[*] inside the feast-server pod.
+# Injected by the operator via feast-spark-engine ConfigMap when running on-cluster;
+# defined here for local dev and as the canonical source of truth.
+#
+# Source-verified fields (SparkComputeEngineConfig in compute_engines/spark/compute.py):
+#   type, spark_conf, staging_location, region, partitions
+#
+# NOTE: SparkComputeEngine passes the entire batch_engine dict to SparkConf().setAll()
+# NOT just the nested spark_conf. Spark session config should live in offline_store.spark_conf
+# which is reliably applied via get_spark_session_or_start_new_with_repoconfig().
+# The spark_conf here is kept for operator injection (feast-spark-engine ConfigMap) only.
+#
+# partitions: controls repartitioning before Redis writes (top-level field, NOT spark conf).
+# For 35M users + 9.8M items — 200 partitions keeps Redis pipeline writes bounded.
+batch_engine:
+  type: spark.engine
+  partitions: 200
+  spark_conf:
+    spark.master: "local[*]"
+    spark.ui.enabled: "false"
+    spark.eventLog.enabled: "false"
+    spark.sql.session.timeZone: "UTC"
+    spark.sql.execution.arrow.pyspark.enabled: "true"
+    spark.sql.execution.arrow.fallback.enabled: "true"
+    spark.sql.shuffle.partitions: "200"
+    spark.default.parallelism: "200"
+    spark.driver.memory: "8g"
+    spark.executor.memory: "8g"
+    spark.sql.execution.arrow.maxRecordsPerBatch: "50000"
+    spark.hadoop.fs.s3a.endpoint: "${AWS_ENDPOINT_URL_S3:-http://minio.smartshop.svc.cluster.local:9000}"
+    spark.hadoop.fs.s3a.path.style.access: "true"
+    spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+    spark.hadoop.fs.s3a.aws.credentials.provider: "com.amazonaws.auth.EnvironmentVariableCredentialsProvider"
+    spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+    spark.hadoop.fs.s3a.connection.maximum: "100"
+    spark.hadoop.fs.s3a.threads.max: "64"
 
 online_store:
   type: redis
