@@ -66,11 +66,11 @@ _all_item_indices: Optional[torch.Tensor] = None
 _feast_store = None
 
 ITEM_FEATURES = [
-    "item_features:item_title",
-    "item_features:item_brand",
-    "item_features:item_category",
+    "item_metadata:item_title",
+    "item_metadata:item_brand",
+    "item_metadata:item_category",
     "item_features:item_avg_rating",
-    "item_features:item_price",
+    "item_metadata:item_price",
 ]
 
 

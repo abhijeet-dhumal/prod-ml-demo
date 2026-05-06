@@ -101,7 +101,7 @@ SparkFeatureBuilder executes DAG per feature view:
   │    │  each executor reads ~72 MB/partition from MinIO via S3A
   │
   ├─ [SparkTransformationNode]
-  │    @batch_feature_view UDF(df) → user_features OR item_features
+  │    @batch_feature_view UDF(df) → user_features / item_features / item_metadata
   │    groupBy("user_id").agg(avg_rating, count, countDistinct, ...)
   │    400-partition shuffle (spark.sql.shuffle.partitions=400)
   │
@@ -114,9 +114,10 @@ SparkFeatureBuilder executes DAG per feature view:
   │    │  partitions=10 → 10 concurrent Redis pipeline connections
   │    └─ offline=False → skip write-back to source (prevents corruption)
   │
-  └─ Redis: 26,493,202 keys written
+  └─ Redis: 26,493,202+ keys written
        user_features: ~11.8M keys  (user_id → 6 features)
-       item_features: ~14.7M keys  (item_id → 6 features)
+       item_features: ~14.7M keys  (item_id → 5 features)
+       item_metadata: ~2M keys     (item_id → 4 features)
 ```
 
 **Key Kubernetes networking requirement:** The Spark driver (running inside the Feast pod) must be reachable by executor pods. This requires:
@@ -192,7 +193,7 @@ This eliminates the need for `scripts/preprocess_reviews_full.py` entirely.
 | `user_category_count` | Int64 | `size(collect_set(category))` |
 | `user_tenure_days` | Int64 | `(max_ts - min_ts) / 86_400_000` ms→days |
 
-### `item_features` — per-item aggregates
+### `item_features` — per-item review aggregates
 
 | Feature | Type | Computation |
 |---------|------|-------------|
@@ -201,7 +202,15 @@ This eliminates the need for `scripts/preprocess_reviews_full.py` entirely.
 | `item_review_count` | Int64 | `count(*)` |
 | `item_total_helpful_votes` | Int64 | `sum(helpful_vote)` |
 | `item_avg_review_length` | Float64 | `avg(length(text))` |
-| `item_price` | Float32 | null (metadata join not in raw reviews) |
+
+### `item_metadata` — product catalog (from `raw_metadata_source`)
+
+| Feature | Type | Computation |
+|---------|------|-------------|
+| `item_title` | String | Product title from metadata parquet |
+| `item_brand` | String | `store` (Electronics) / `author` (Books) / NULL |
+| `item_category` | String | `main_category` |
+| `item_price` | Float32 | `CAST(price AS FLOAT)` |
 
 ### Important UDF Contract
 
@@ -226,7 +235,7 @@ offline=False,  # MUST be False — SparkWriteNode would append transformed rows
 
 ## 5. Spark DAG — Stage Breakdown
 
-Each feature view (`user_features`, `item_features`) runs as an independent Spark application. Stages observed during full-dataset runs:
+Each feature view (`user_features`, `item_features`, `item_metadata`) runs as an independent Spark job. Stages observed during full-dataset runs:
 
 ```
 user_features:
@@ -469,7 +478,7 @@ data:
 | Source | `s3a://smartshop-raw/raw/reviews/*/` |
 | Size | **29.6 GB**, 282 Parquet files |
 | Time range materialized | `2020-01-01` → `2024-12-31` |
-| Feature views | `user_features` + `item_features` |
+| Feature views | `user_features` + `item_features` + `item_metadata` |
 | Expected keys | 26,493,202 |
 | Redis memory at full load | ~6.2 Gi |
 
@@ -708,7 +717,7 @@ URL: `spark-history-smartshop.<cluster-domain>`
 Event logs: `s3a://smartshop-features/spark-events/`
 
 ![Spark History — all completed apps](../assets/spark-history-all-apps-completed.png)
-*Spark History Server showing all completed materialization applications. Each `feast materialize` call = 2 Spark apps (user_features + item_features).*
+*Spark History Server showing all completed materialization applications. Each `feast materialize` call = 3 Spark apps (user_features + item_features + item_metadata).*
 
 ![Spark History — both CPU and RAPIDS runs](../assets/spark-history-both-runs-completed.png)
 *Both CPU and RAPIDS run apps visible side-by-side in history server*
@@ -751,13 +760,13 @@ URL: `redisinsight-smartshop.<cluster-domain>`
 ### RHOAI Feature Store UI
 
 ![RHOAI Feast feature views list](../assets/rhoai-feast-features-list.png)
-*RHOAI dashboard: registered feature views — `user_features` and `item_features` visible after `feast apply`*
+*RHOAI dashboard: registered feature views — `user_features`, `item_features`, and `item_metadata` visible after `feast apply`*
 
 ![RHOAI Feast data sources](../assets/rhoai-feast-data-sources.png)
 *RHOAI Feature Store: data source registered — `raw_reviews_source` pointing to `s3a://smartshop-raw/raw/reviews/*/`*
 
 ![RHOAI Feast lineage graph](../assets/rhoai-feast-lineage-full.png)
-*Full lineage graph: raw_reviews_source → user_features / item_features → Redis online store*
+*Full lineage graph: raw_reviews_source → user_features / item_features, raw_metadata_source → item_metadata → Redis online store*
 
 ![Feast feature views (CLI/UI)](../assets/feast-feature-views-list.png)
 ![Feast lineage post apply](../assets/feast-lineage-post-apply.png)

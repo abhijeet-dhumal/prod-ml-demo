@@ -194,7 +194,7 @@ What happens internally:
 1. `SparkComputeEngine` reads `batch_engine` config from `feature_store.yaml` (injected by `feast-spark-engine` ConfigMap)
 2. SparkSession starts (`local[*]` — runs in feast pod JVM, `JAVA_TOOL_OPTIONS=-Dcom.redhat.fips=false` baked into image)
 3. `SELECT * FROM s3a://smartshop-raw/processed/reviews/ WHERE event_timestamp BETWEEN ...`
-4. BFV UDF: `groupBy(user_id).agg(avg_rating, review_count, ...)` + `groupBy(item_id).agg(...)` → transformed DataFrame
+4. BFV UDFs: `groupBy(user_id).agg(...)` + `groupBy(item_id).agg(...)` + `item_metadata` from metadata parquet → transformed DataFrames
 5. `mapInArrow` serializes + writes each entity row to Redis online store (`partitions: 10` to avoid OOMKill)
 6. Redis DBSIZE increases to ~3.1M keys
 
@@ -239,7 +239,7 @@ entity_df = interactions[["user_id", "item_id", "event_timestamp"]]
 entity_df["event_timestamp"] = pd.to_datetime(entity_df["event_timestamp"], unit="ms", utc=True)
 training_df = store.get_historical_features(
     entity_df=entity_df,
-    features=["user_features:user_avg_rating", ..., "item_features:item_price"],
+    features=["user_features:user_avg_rating", ..., "item_metadata:item_price"],
 ).to_df()
 ```
 
@@ -297,6 +297,7 @@ oc exec -n smartshop "$FEAST_POD" -c offline -- bash -c "
 # Applying changes for project smartshop
 # Deploying infrastructure for user_features
 # Deploying infrastructure for item_features
+# Deploying infrastructure for item_metadata
 # Deploying infrastructure for review_embeddings
 ```
 
@@ -330,7 +331,7 @@ oc exec -n smartshop "$FEAST_POD" -c offline -- bash -c "
 >         pa.field("item_id", pa.string()), pa.field("event_timestamp", ts),
 >         pa.field("item_avg_rating", pa.float64()), pa.field("item_rating_stddev", pa.float64()),
 >         pa.field("item_review_count", pa.int64()), pa.field("item_total_helpful_votes", pa.int64()),
->         pa.field("item_avg_review_length", pa.float64()), pa.field("item_price", pa.float32()),
+>         pa.field("item_avg_review_length", pa.float64()),
 >     ]),
 >     "smartshop-embeddings/review_embeddings/_placeholder.parquet": pa.schema([
 >         pa.field("review_id", pa.string()), pa.field("event_timestamp", ts),
@@ -350,7 +351,7 @@ oc exec -n smartshop "$FEAST_POD" -c offline -- bash -c "
 
 ### 8d — Feature View Definitions (`@batch_feature_view`)
 
-Both feature views are declared in `feast/feature_repo/features.py` using the `@batch_feature_view` decorator with `TransformationMode.PYTHON`. The UDF receives the full raw reviews DataFrame and returns the aggregated features:
+Feature views are declared in `feast/feature_repo/features.py` using the `@batch_feature_view` decorator with `TransformationMode.PYTHON`. Each UDF receives its source DataFrame and returns the computed features:
 
 **`user_features`** — aggregated per `user_id`:
 
@@ -363,7 +364,7 @@ Both feature views are declared in `feast/feature_repo/features.py` using the `@
 | `user_category_count` | Int64 | Distinct product categories reviewed |
 | `user_tenure_days` | Int64 | Days from first to last review |
 
-**`item_features`** — aggregated per `item_id` (from `parent_asin`):
+**`item_features`** — review aggregates per `item_id` (from `parent_asin`):
 
 | Feature | Type | Description |
 |---------|------|-------------|
@@ -372,9 +373,17 @@ Both feature views are declared in `feast/feature_repo/features.py` using the `@
 | `item_review_count` | Int64 | Total reviews received |
 | `item_total_helpful_votes` | Int64 | Sum of helpful votes across all reviews |
 | `item_avg_review_length` | Float64 | Mean review length |
-| `item_price` | Float32 | `null` — metadata join not in BFV scope |
 
-Both views: `TTL=3650d`, `online=True`, `offline=False`.
+**`item_metadata`** — product catalog per `item_id` (from metadata parquet via `raw_metadata_source`):
+
+| Feature | Type | Description |
+|---------|------|-------------|
+| `item_title` | String | Product title |
+| `item_brand` | String | Brand / store / author |
+| `item_category` | String | Main product category |
+| `item_price` | Float32 | Listed price |
+
+All views: `TTL=3650d`, `online=True`, `offline=False`.
 
 > **Why `offline=False`?** Feast's `SparkWriteNode` uses `offline=True` to append the transformed DataFrame **back into `batch_source.path`** — which is `processed/reviews/`. Leaving it `True` would corrupt the raw source on every materialization run. `offline=False` skips the write-back while still serving `get_historical_features()` (reads apply the UDF on-demand from source).
 
@@ -396,8 +405,8 @@ Both views: `TTL=3650d`, `online=True`, `offline=False`.
 
 [Step 3]  feast apply + feast materialize-incremental (see §8f below)
              SparkComputeEngine reads processed/reviews/
-             @batch_feature_view UDF: groupBy/agg → user_features + item_features
-             Writes → Redis (~3.1M keys, ~2 min on full dataset)
+             @batch_feature_view UDFs: user_features + item_features + item_metadata
+             Writes → Redis (~3.1M+ keys)
              NO smartshop-features/ Parquet needed for materialization
 
 [Step 4]  Spark jobs — text preprocessing + embeddings (separate pipeline)
@@ -417,7 +426,7 @@ Both views: `TTL=3650d`, `online=True`, `offline=False`.
 
 The RHOAI Dashboard shows the registered feature views, entities, and lineage graph:
 
-**Feature views list** — 3 views registered, all Online-enabled:
+**Feature views list** — 4 views registered, all Online-enabled:
 
 ![Feast feature views list in RHOAI dashboard](./assets/feast-feature-views-list.png)
 
@@ -433,9 +442,9 @@ The RHOAI Dashboard shows the registered feature views, entities, and lineage gr
 
 ![RHOAI Feature Store — data sources: raw_reviews_source and review_embeddings_source](./assets/rhoai-feast-data-sources.png)
 
-**Features** — 12 features across `item_features` and `user_features` views:
+**Features** — 15 features across `user_features`, `item_features`, and `item_metadata` views:
 
-![RHOAI Feature Store — features list: item_avg_rating, item_price, user_avg_rating, user_review_count, …](./assets/rhoai-feast-features-list.png)
+![RHOAI Feature Store — features list: item_avg_rating, item_title, user_avg_rating, user_review_count, …](./assets/rhoai-feast-features-list.png)
 
 > **Note on `__dummy` entity in lineage:** The lineage graph shows an internal
 > Feast `__no_join_key` placeholder rendered as `Entity: __dummy`. This is a

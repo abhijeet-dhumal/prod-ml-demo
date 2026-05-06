@@ -66,11 +66,11 @@ _ITEM_FEAT_COLS = [
     "item_review_count",
     "item_total_helpful_votes",
     "item_avg_review_length",
-    "item_price",
 ]
 _FEAST_FEATURES = (
     [f"user_features:{c}" for c in _USER_FEAT_COLS]
     + [f"item_features:{c}" for c in _ITEM_FEAT_COLS]
+    + ["item_metadata:item_price"]
 )
 
 

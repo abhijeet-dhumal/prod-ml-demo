@@ -1,20 +1,9 @@
 ---
 # FeatureStore CR — SmartShop AI
 #
-# Uses SparkOfflineStore + SparkComputeEngine (feast-spark-server custom image).
-# Services run in one shared Deployment (feast-smartshop-feast).
-#
-# Init containers are disabled — feast apply and feast materialize are run manually
-# via oc exec after the pod starts. This avoids the init container using the default
-# feast[minimal] image (which lacks pyspark) when features.py imports SparkSource.
-#
 # Apply:
-#   source .env
-#   envsubst < infrastructure/openshift/feast-spark-engine.yaml | oc apply -f -
-#   envsubst < infrastructure/openshift/feast-operator.yaml | oc apply -f -
-#
-# After pod Ready, run feast apply + feast materialize-incremental via oc exec.
-# See docs/feast/BFV-DESIGN.md for the full workflow and scripts/wait-and-materialize.sh.
+#   envsubst < manifests/feast-spark-engine-rapids.yaml | oc apply -f -
+#   envsubst < manifests/feast-operator.yaml | oc apply -f -
 apiVersion: feast.dev/v1
 kind: FeatureStore
 metadata:
@@ -25,40 +14,36 @@ metadata:
 spec:
   feastProject: smartshop
 
-  # Git repo where feast/feature_repo lives.
-  # Init containers clone this repo to /feast-data/smartshop/feature_repo/
-  # and run `feast apply` before the main containers start.
-  # Since all service images are overridden to feast-spark-server (which has pyspark),
-  # the init container can also import SparkSource and run `feast apply` against
-  # the live Parquet files in MinIO.
   feastProjectDir:
     git:
-      url: ${GIT_REPO}
-      ref: ${GIT_BRANCH}
+      url: ${GIT_REPO:-https://github.com/abhijeet-dhumal/prod-ml-demo.git}
+      ref: ${GIT_BRANCH:-feat/final-phase}
       featureRepoPath: feast/feature_repo
 
-  # batchEngine: injects batch_engine: {type: spark.engine, spark_conf: {...}}
-  # into feature_store.yaml via the feast-spark-engine ConfigMap.
   batchEngine:
     configMapRef:
       name: feast-spark-engine
 
   services:
+    runFeastApplyOnInit: false
+
     offlineStore:
       persistence:
         store:
-          # type: spark → SparkOfflineStore; secret key "spark" holds spark_conf
           type: spark
           secretRef:
             name: feast-spark-config
       server:
-        # Custom image: feature-server:0.62.0 + pyspark==3.5.3 + Java 11 + hadoop-aws JARs
-        # JAVA_TOOL_OPTIONS=-Dcom.redhat.fips=false (FIPS-disabled for AWS SDK v1 S3A signing)
-        # Built by: oc start-build feast-spark-server → pushed to ${REGISTRY}/smartshop-feast-spark-server
-        image: ${FEAST_SERVER_IMAGE}
+        image: ${FEAST_SERVER_IMAGE:-quay.io/abdhumal/smartshop-feast-spark-server:latest}
         envFrom:
           - secretRef:
-              name: feast-s3-credentials  # AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
+              name: feast-s3-credentials
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+          limits:
+            memory: 16Gi
+            nvidia.com/gpu: "1"
 
     onlineStore:
       persistence:
@@ -67,7 +52,7 @@ spec:
           secretRef:
             name: feast-redis-secret
       server:
-        image: ${FEAST_SERVER_IMAGE}
+        image: ${FEAST_SERVER_IMAGE:-quay.io/abdhumal/smartshop-feast-spark-server:latest}
         envFrom:
           - secretRef:
               name: feast-s3-credentials
@@ -78,7 +63,6 @@ spec:
           file:
             path: registry.db
             pvc:
-              # Reuse existing PVC if already created; operator is idempotent
               create:
                 accessModes:
                   - ReadWriteOnce
@@ -88,13 +72,11 @@ spec:
                 storageClassName: ${STORAGE_CLASS:-nfs-csi}
               mountPath: /feast-registry
         server:
-          image: ${FEAST_SERVER_IMAGE}
+          image: ${FEAST_SERVER_IMAGE:-quay.io/abdhumal/smartshop-feast-spark-server:latest}
           envFrom:
             - secretRef:
                 name: feast-s3-credentials
           restAPI: true
 
     ui:
-      # image is a top-level field under services.ui (not services.ui.server)
-      # UI reads feature_store.yaml — needs feast[spark] to parse offline_store.type: spark
-      image: ${FEAST_SERVER_IMAGE}
+      image: ${FEAST_SERVER_IMAGE:-quay.io/abdhumal/smartshop-feast-spark-server:latest}

@@ -32,7 +32,7 @@ def test_offline_features():
             "user_features:user_review_count",
             "item_features:item_avg_rating",
             "item_features:item_review_count",
-            "item_features:item_price_bucket",
+            "item_metadata:item_price",
         ],
     ).to_df()
 

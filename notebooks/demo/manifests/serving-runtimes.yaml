@@ -13,7 +13,7 @@
 #
 # Prerequisites:
 #   - Trained rec model at s3://smartshop-models/recommendation/best_model.pt
-#   - LoRA adapter at s3://smartshop-models/llm-checkpoints/checkpoint-200/
+#   - LoRA adapter at s3://smartshop-models/llm-adapter/
 #   - rec-server image pushed to quay.io (via BuildConfig or manual push)
 #   - Secrets: smartshop-credentials, hf-credentials
 #
@@ -280,7 +280,7 @@ spec:
                 endpoint_url='http://minio.${NAMESPACE}.svc.cluster.local:9000',
                 aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
                 aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'])
-            prefix = '${LLM_ADAPTER_S3_PREFIX:-llm-checkpoints/checkpoint-200/}'
+            prefix = '${LLM_ADAPTER_S3_PREFIX:-llm-adapter/}'
             objs = s3.list_objects_v2(Bucket='${S3_MODELS_BUCKET}', Prefix=prefix).get('Contents', [])
             os.makedirs('/mnt/adapters', exist_ok=True)
             for obj in objs:

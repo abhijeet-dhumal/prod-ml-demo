@@ -78,7 +78,7 @@ platform-level support for teams to adopt this stack at scale.
 | NCCL over OVN-K SDN needs `NCCL_IB_DISABLE=1` or SR-IOV | Full NVLink bandwidth not achievable over default OVN network | Document SR-IOV / InfiniBand config for multi-node training |
 | No native training job queue/priority | Multiple TrainJobs compete for GPUs with no fairness policy | Kueue (already in ecosystem) for GPU quota-based queuing |
 | FSDP checkpoint format not standardized | `torch.save` vs `torch.distributed.checkpoint` incompatibility | RHOAI should recommend and document checkpoint format |
-| `item_feat_dim` default in `model.py` was 8 but data has 6 features | Latent trap: `TwoTowerModel()` without checkpoint would silently build wrong shape | ✅ Fixed — default now 6; checkpoint saves/restores actual dims (RHOAIENG-57388 Bug 1) |
+| `item_feat_dim` default in `model.py` was 8 but data has 5 review features + 1 price from `item_metadata` | Latent trap: `TwoTowerModel()` without checkpoint would silently build wrong shape | ✅ Fixed — checkpoint saves/restores actual dims (RHOAIENG-57388 Bug 1) |
 | N+1 Feast lookups in recommendation server | 100 sequential Redis round-trips per request | ✅ Fixed — single batched `get_online_features()` call (RHOAIENG-57388 Bug 6) |
 | Training pod had no `feature_store.yaml` | `FeatureStore(repo_path="/feast/feature_repo")` would crash — path doesn't exist in trainer image | ✅ Fixed — `feature_store_training.yaml` (remote registry) baked into image via Containerfile |
 

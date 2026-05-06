@@ -637,8 +637,8 @@ ARCH_HTML = """
       <div class="arch-detail" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;text-align:left;">
         <div>
           <strong style="color:var(--text-primary);">Tabular features → Redis</strong><br>
-          <small>user_features (1.6M users) · item_features (1.6M items)<br>
-          <code style="font-size:10px;">feast materialize</code> from offline Parquet → online &lt;1ms lookups</small>
+          <small>user_features · item_features · item_metadata<br>
+          <code style="font-size:10px;">feast materialize</code> → online &lt;1ms lookups</small>
         </div>
         <div>
           <strong style="color:var(--text-primary);">Vector features → Milvus</strong><br>

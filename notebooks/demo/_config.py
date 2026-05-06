@@ -57,10 +57,14 @@ SPARK_JOBS_IMAGE = os.environ.get(
 )
 
 # ── Container images ────────────────────────────────────────────────
+# Override via env or .env: REC_SERVER_IMAGE=quay.io/<your-org>/smartshop-rec-server:latest
+REGISTRY = os.environ.get("REGISTRY", "quay.io/abdhumal")
 REC_SERVER_IMAGE = os.environ.get(
-    "REC_SERVER_IMAGE", "quay.io/abdhumal/smartshop-rec-server:latest"
+    "REC_SERVER_IMAGE", f"{REGISTRY}/smartshop-rec-server:latest"
 )
-RAG_SERVER_IMAGE = os.environ.get("RAG_SERVER_IMAGE", REC_SERVER_IMAGE)
+RAG_SERVER_IMAGE = os.environ.get(
+    "RAG_SERVER_IMAGE", f"{REGISTRY}/smartshop-rag-server:latest"
+)
 
 # ── Models ──────────────────────────────────────────────────────────
 LLM_BASE_MODEL = os.environ.get(

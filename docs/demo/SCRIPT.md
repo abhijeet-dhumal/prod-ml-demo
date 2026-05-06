@@ -64,7 +64,7 @@
 
 1. Open **MinIO Console**: `https://minio-console-smartshop.${OC_CLUSTER_DOMAIN}`
 2. Navigate to `smartshop-raw` → `raw/` — show the raw Amazon Reviews JSON files (~49 GB)
-3. Navigate to `smartshop-features` → `user_features/` and `item_features/` — show Spark output Parquet files
+3. Navigate to `smartshop-features` → `user_features/` and `item_features/` — show Spark output Parquet files (metadata features come from `raw/metadata/` via a separate `item_metadata` view)
 
 **Say:**
 > "This is MinIO — our S3-compatible object store running on-cluster.
@@ -142,7 +142,7 @@ oc get secret grafana-admin-credentials -n smartshop \
 ### 4a. Feast UI — show feature definitions
 
 1. Open **Feast UI**: `https://feast-smartshop-feast-ui-smartshop.${OC_CLUSTER_DOMAIN}`
-2. Click **Feature Views** — show `user_features`, `item_features`, `review_embeddings`
+2. Click **Feature Views** — show `user_features`, `item_features`, `item_metadata`, `review_embeddings`
 3. Click `user_features` — show the feature schema (avg_rating, review_count, avg_price, etc.)
 
 **Say:**

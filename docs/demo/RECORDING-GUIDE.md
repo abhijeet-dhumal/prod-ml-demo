@@ -99,7 +99,7 @@ This document provides **detailed, step-by-step instructions** for recording eac
    - Scroll through the Parquet/JSON files — show file sizes to convey 49 GB scale
    - Hover over a few files so the tooltip shows size
 5. Go back to bucket list, click **`smartshop-features`**:
-   - Show `user_features/` and `item_features/` folders — these are Spark ETL output
+   - Show `user_features/` and `item_features/` folders — these are Spark ETL review aggregates
 6. Go back, click **`smartshop-models`**:
    - Show `recommendation/` (Two-Tower model) and `llm-checkpoints/` (LoRA adapter)
 
@@ -213,7 +213,7 @@ This document provides **detailed, step-by-step instructions** for recording eac
 
 1. **Feast UI**: `https://feast-smartshop-feast-ui-smartshop.apps.oai-kft-ibm.ibm.rh-ods.com`
    - Click **Feature Views** in the left sidebar
-   - You should see: `user_features`, `item_features`, `review_embeddings`
+   - You should see: `user_features`, `item_features`, `item_metadata`, `review_embeddings`
    - Click **`user_features`**:
      - Show the feature schema: `avg_rating`, `review_count`, `avg_price`, `total_reviews`, etc.
      - Show the entity: `user_id`

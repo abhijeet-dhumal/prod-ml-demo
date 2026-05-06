@@ -116,7 +116,7 @@ oc get secret grafana-admin-credentials -n smartshop \
 
 | Step | Action |
 |------|--------|
-| 1 | Open Feast UI → Feature Views → show `user_features`, `item_features`, `review_embeddings` |
+| 1 | Open Feast UI → Feature Views → show `user_features`, `item_features`, `item_metadata`, `review_embeddings` |
 | 2 | Click `user_features` → show schema |
 | 3 | Switch to RedisInsight → show 35M+ keys |
 | 4 | Click one key → show hash fields (pre-computed feature vector) |

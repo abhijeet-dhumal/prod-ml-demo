@@ -10,6 +10,8 @@ End-to-end ML pipeline on Red Hat OpenShift AI. Run these notebooks in order fro
 - FeatureStore CR, ServingRuntimes, `feast-spark-engine` ConfigMap pre-created by admin
 - Environment variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (via DataConnection)
 
+See [Admin Setup Runbook](#admin-setup-runbook) below for first-time cluster provisioning.
+
 ## Pipeline
 
 | # | Notebook | What it does | Time |
@@ -49,6 +51,7 @@ demo/
     ├── feast-operator.yaml             #   FeatureStore CR
     ├── feast-spark-engine.yaml         #   Feast batch engine ConfigMap + Spark secret
     ├── feast-spark-engine-rapids.yaml  #   Feast Spark engine (RAPIDS GPU variant)
+    ├── feast-spark-driver-svc.yaml     #   Spark driver ClusterIP Service
     ├── serving-runtimes.yaml           #   vLLM + rec ServingRuntimes + InferenceServices
     ├── data-download-job.yaml          #   HuggingFace → S3 download Job template
     ├── trainjobs.yaml                  #   Kubeflow TrainJob definitions
@@ -191,3 +194,113 @@ flowchart TD
     LLMSrv -->|"generation"| RAGSrv
     RecSrv & RAGSrv --> UI["Demo UI\n(Gradio)"]
 ```
+
+## Environment Variables
+
+Copy `.env.example` to `.env` and fill in credentials. On-cluster, the RHOAI DataConnection injects
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` automatically. Override image references via
+`REGISTRY`, `REC_SERVER_IMAGE`, `RAG_SERVER_IMAGE`, etc. — see `.env.example` for the full list.
+
+## Admin Setup Runbook
+
+One-time cluster provisioning before users can run notebooks. All commands assume `oc login` to the target cluster.
+
+### 1. Create namespace and RBAC
+
+```bash
+oc new-project smartshop
+```
+
+### 2. Deploy infrastructure
+
+| Component | How | Notes |
+|-----------|-----|-------|
+| **MinIO** | Helm or OperatorHub | Create buckets: `smartshop-features`, `smartshop-models` |
+| **Redis** | `oc apply -f infrastructure/openshift/redis.yaml` | Password in `smartshop-credentials` Secret |
+| **Milvus** | Helm (`milvus-standalone`) | Default port 19530 |
+| **Postgres** | OperatorHub (Crunchy / CloudNativePG) | For Feast registry |
+
+### 3. Create secrets
+
+```bash
+# From .env file
+set -a && source .env && set +a
+
+# S3 + Redis credentials
+oc create secret generic smartshop-credentials -n smartshop \
+  --from-literal=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+  --from-literal=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+  --from-literal=AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}" \
+  --from-literal=REDIS_PASSWORD="$REDIS_PASSWORD" \
+  --dry-run=client -o yaml | oc apply -f -
+
+# HuggingFace token (for gated models like Mistral)
+oc create secret generic hf-credentials -n smartshop \
+  --from-literal=token="$HF_TOKEN" \
+  --dry-run=client -o yaml | oc apply -f -
+
+# Service CA ConfigMap (for TLS to Feast registry)
+oc apply -f manifests/service-ca-configmap.yaml
+```
+
+### 4. Deploy Feast
+
+```bash
+# Spark engine ConfigMap (RAPIDS GPU variant)
+envsubst < manifests/feast-spark-engine-rapids.yaml | oc apply -f -
+
+# Spark driver Service (stable host for executor→driver comms)
+envsubst < manifests/feast-spark-driver-svc.yaml | oc apply -f -
+
+# FeatureStore CR (Feast Operator deploys offline/online/registry servers)
+envsubst < manifests/feast-operator.yaml | oc apply -f -
+```
+
+### 5. Download raw data
+
+```bash
+envsubst < manifests/data-download-job.yaml | oc apply -f -
+oc wait --for=condition=complete job/smartshop-data-download -n smartshop --timeout=30m
+```
+
+### 6. Deploy serving infrastructure
+
+```bash
+envsubst < manifests/serving-runtimes.yaml | oc apply -f -
+```
+
+### 7. Create RHOAI workbench
+
+- Image: **PyTorch** (CUDA), Size: **Large** (8 CPU, 32 Gi)
+- Attach **DataConnection** to MinIO (injects `AWS_*` env vars)
+- Attach **FeatureStore** connection `smartshop` (auto-mounts Feast client config)
+- Install JDK in the workbench (required for NB03 Spark driver — see below)
+
+### 8. JDK installation (workbench)
+
+Notebook 03 (embeddings) runs a Spark driver inside the workbench, which requires a JDK.
+Run once in a workbench terminal:
+
+```bash
+mkdir -p ~/.local/java && cd ~/.local/java
+curl -sL https://download.java.net/java/GA/jdk17.0.2/dfd4a8d0985749f896bed50d7138ee7f/8/GPL/openjdk-17.0.2_linux-x64_bin.tar.gz | tar xz
+echo 'export JAVA_HOME=~/.local/java/jdk-17.0.2' >> ~/.bashrc
+echo 'export PATH=$JAVA_HOME/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+java -version
+```
+
+The `JAVA_HOME` path is already set in NB03's `%%yaml parameters` block.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `feast materialize` hangs | Check Spark executors: `oc get pods -l feast-job=materialize -n smartshop` |
+| Executor `OOMKilled` | Increase `spark.executor.memory` in `feast-spark-engine` ConfigMap |
+| Executor `ImagePullBackOff` | Verify `spark.kubernetes.container.image` in ConfigMap points to accessible registry |
+| `ConnectionRefused` on Feast offline store | Restart Feast pod: `oc delete pod -l feast.dev/name=smartshop-feast -n smartshop` |
+| `gRPC resource exhausted` | Don't call `store.materialize()` from notebook — use K8s exec on Feast pod |
+| Item features `None` after materialize | Verify `features.py` on Feast pod matches local copy (`oc exec ... cat /feast-data/.../features.py`) |
+| KServe ISVC stuck `Unknown` | Check `oc describe isvc <name>` and `oc get events --sort-by=.lastTimestamp` |
+| vLLM OOM on base model | Reduce `--max-model-len` or increase GPU memory in ServingRuntime |

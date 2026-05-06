@@ -342,9 +342,25 @@ review_embeddings_source = SparkSource(
     file_format="parquet",
     timestamp_field="event_timestamp",
 )
+
+# Product catalog metadata — UNION ALL across category-specific parquet files
+# (each file has different brand column names: store / author / NULL)
+raw_metadata_source = SparkSource(
+    name="raw_metadata_source",
+    query=(
+        "SELECT parent_asin, title, main_category, "
+        "CAST(price AS FLOAT) AS price, store AS brand, "
+        "TIMESTAMP('2020-01-01') AS event_timestamp "
+        "FROM parquet.`s3a://smartshop-raw/raw/metadata/Electronics_meta/` "
+        "UNION ALL ..."
+    ),
+    timestamp_field="event_timestamp",
+)
 ```
 
 Note: `s3a://` protocol is required for SparkSource (uses hadoop-aws). The `s3_endpoint_override` parameter used by `FileSource` is replaced by `spark.hadoop.fs.s3a.endpoint` in the engine config.
+
+> **`item_metadata` feature view:** Reads from `raw_metadata_source` (a SQL `UNION ALL` across Electronics, Books, and Home_and_Kitchen metadata files). This is separate from `item_features` which computes review aggregates from `raw_reviews_source`.
 
 ### 7. `feature_store.yaml` (local dev)
 

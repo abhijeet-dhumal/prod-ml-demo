@@ -107,9 +107,6 @@ spec:
         - name: service-ca
           mountPath: /var/run/secrets/service-ca
           readOnly: true
-        - name: feast-config
-          mountPath: /feast/feature_repo
-          readOnly: true
       volumes:
       - name: shm
         emptyDir:
@@ -118,9 +115,6 @@ spec:
       - name: service-ca
         configMap:
           name: smartshop-service-ca
-      - name: feast-config
-        configMap:
-          name: feast-training-config
 
 ---
 # Kubeflow Trainer - LLM Fine-Tuning (QLoRA + FSDP)
