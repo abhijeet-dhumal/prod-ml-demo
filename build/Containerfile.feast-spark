@@ -2,11 +2,8 @@
 #
 # Extends quay.io/feastdev/feature-server:0.62.0 (feast[minimal], Python 3.12, UBI9)
 # with:
-#   - Feast patched from fork branch fix/bfv-python-mode-column-info (3 upstream bug fixes):
-#       Bug 1: feature_builder.py — get_column_info() missing "python" mode guard  (PR #6310)
-#       Bug 2: spark.py — pull_all_from_table_or_query() missing SELECT * fallback  (PR #6311)
-#       Bug 3: spark/utils.py — pre-create S3A event log dir before SparkContext    (PR #6317)
-#     PRs pending merge at https://github.com/feast-dev/feast
+#   - Feast 0.63.0 from fork branch fix/spark-vector-store-materialization
+#     (upstream fixes + foreachPartition write + session config forwarding)
 #   - pyspark==3.5.3 and hadoop-aws JARs for s3a:// MinIO access
 #
 # Used by:
@@ -27,9 +24,9 @@ FROM quay.io/feastdev/feature-server:0.62.0
 
 USER 0
 
-# Install git so pip can clone the feast fork (needed for git+ install below).
-# Java 11 is required by PySpark 3.5.3 / Spark 3.5 to launch the JVM (SparkContext).
-RUN microdnf install -y java-11-openjdk-headless && microdnf clean all
+# git: pip needs it for git+ install of the feast fork below.
+# Java 11: required by PySpark 3.5.3 / Spark 3.5 to launch the JVM (SparkContext).
+RUN microdnf install -y java-11-openjdk-headless git && microdnf clean all
 ENV JAVA_HOME=/usr/lib/jvm/jre-11
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 # JAVA_TOOL_OPTIONS is the standard JVM env var read by ALL JVM processes at startup
@@ -39,31 +36,11 @@ ENV PATH="${JAVA_HOME}/bin:${PATH}"
 # (AWS SDK v1 request signing). Must be set before JVM starts, not via SparkConf.
 ENV JAVA_TOOL_OPTIONS="-Dcom.redhat.fips=false"
 
-# Patch the three files containing BFV + S3A bug fixes.
-# This avoids reinstalling feast (which would replace the feast CLI entry point)
-# while still getting the fixed code into the installed site-packages.
-#   Bug 1: feature_builder.py — get_column_info() missing "python" mode guard  (PR #6310)
-#   Bug 2: spark.py — pull_all_from_table_or_query() missing SELECT * fallback  (PR #6311)
-#   Bug 3: spark/utils.py — full set of Spark compute engine fixes for vector store
-#            materialization (S3A event log init, SQL config reuse, getattr guard,
-#            map_in_pandas sentinel schema, write_to_online/offline_store helpers,
-#            spark_embed() utility with executor-local model singleton cache)
-#   Bug 4: spark/nodes.py — replace mapInArrow with foreachPartition in SparkWriteNode
-#            to avoid ArrowStreamPandasUDFSerializer mismatch when WindowGroupLimitExec
-#            is upstream in the physical plan (AttributeError: 'list' has no .dtype)
-# PRs pending merge at https://github.com/feast-dev/feast — remove this block once merged.
-RUN FEAST_SITE=$(python3 -c 'import feast, os; print(os.path.dirname(feast.__file__))') && \
-    echo "Patching feast in ${FEAST_SITE}" && \
-    FORK="https://raw.githubusercontent.com/abhijeet-dhumal/feast/feat/spark-vector-store-materialization/sdk/python" && \
-    curl -fsSL -o "${FEAST_SITE}/infra/compute_engines/feature_builder.py" \
-      "${FORK}/feast/infra/compute_engines/feature_builder.py" && \
-    curl -fsSL -o "${FEAST_SITE}/infra/offline_stores/contrib/spark_offline_store/spark.py" \
-      "${FORK}/feast/infra/offline_stores/contrib/spark_offline_store/spark.py" && \
-    curl -fsSL -o "${FEAST_SITE}/infra/compute_engines/spark/utils.py" \
-      "${FORK}/feast/infra/compute_engines/spark/utils.py" && \
-    curl -fsSL -o "${FEAST_SITE}/infra/compute_engines/spark/nodes.py" \
-      "${FORK}/feast/infra/compute_engines/spark/nodes.py" && \
-    echo "Patch applied OK"
+# Install Feast from fork branch (upstream 0.63.0 + Spark vector store materialization fixes).
+# Replaces the base image's 0.62.0 with our patched version in one shot.
+# PRs pending merge at https://github.com/feast-dev/feast — switch to upstream once merged.
+RUN pip install --no-cache-dir \
+    "feast[spark] @ git+https://github.com/abhijeet-dhumal/feast.git@fix/spark-vector-store-materialization#subdirectory=sdk/python"
 
 # Install pyspark — pinned to 3.5.3 to match Hadoop 3.3.4 (AWS SDK v1 compatible)
 RUN pip install --no-cache-dir pyspark==3.5.3

@@ -72,10 +72,10 @@ spec:
             - -c
             - |
               # ── Build a self-contained feast repo dir in /tmp/feast-repo ────────────
-              # feast apply infers the repo root from the directory of the -c config file.
-              # Both features.py and features_milvus.py must live alongside the config.
+              # Only copy features_milvus.py (the BFV with vector fields).
+              # Do NOT copy features.py — it defines user_features/item_features which
+              # have no vector field and cause Milvus create_collection to fail.
               mkdir -p /tmp/feast-repo
-              cp /feast-repo/features.py /tmp/feast-repo/features.py
               cp /feast-repo/features_milvus.py /tmp/feast-repo/features_milvus.py
 
               # Render template vars (Python string.Template, no envsubst needed)

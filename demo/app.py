@@ -205,6 +205,19 @@ def _guess_category(asin: str) -> tuple[str, str]:
     return "General", "📦"
 
 
+def _star_rating_html(rating: float) -> str:
+    if not rating:
+        return ""
+    full = int(rating)
+    half = 1 if rating - full >= 0.25 else 0
+    empty = 5 - full - half
+    stars = "★" * full + ("½" if half else "") + "☆" * empty
+    return (
+        f'<span style="color:#f59e0b;font-size:13px;letter-spacing:-1px;">{stars}</span>'
+        f'<span style="font-size:12px;color:var(--text-muted);margin-left:4px;">{rating:.1f}</span>'
+    )
+
+
 def _status_strip_html() -> str:
     s = _stats_summary()
 
@@ -264,20 +277,52 @@ def get_recommendations(user_id: str, top_k: int = 10):
 
             cards = ""
             for i, rec in enumerate(recs, 1):
-                cat, icon = _guess_category(rec["item_id"])
+                title = rec.get("title") or ""
+                brand = rec.get("brand") or ""
+                category = rec.get("category") or ""
+                avg_rating = rec.get("avg_rating")
+                price = rec.get("price")
+
+                if not title:
+                    cat_guess, icon = _guess_category(rec["item_id"])
+                    title = cat_guess
+                else:
+                    _, icon = _guess_category(rec["item_id"])
+                    if not icon or icon == "📦":
+                        icon = {"Electronics": "🎧", "Books": "📚", "Home": "🏠"}.get(
+                            (category or "").split()[0], "📦"
+                        )
+
+                display_title = title[:65] + "…" if len(title) > 65 else title
+
+                meta_parts = []
+                if brand:
+                    meta_parts.append(brand)
+                if category and category != "All Electronics":
+                    meta_parts.append(category)
+                meta_line = " · ".join(meta_parts) if meta_parts else ""
+
+                stars_html = _star_rating_html(avg_rating) if avg_rating else ""
+                price_html = f'<span style="font-size:12px;font-weight:600;color:var(--text-primary);">${price:.0f}</span>' if price else ""
+
                 pct = int(rec["score"] / top_score * 100) if top_score else 0
                 bar_color = "#2563eb" if pct > 60 else "#f59e0b" if pct > 30 else "#94a3b8"
                 medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"#{i}"
+
                 cards += (
                     f'<div style="display:flex;align-items:center;gap:12px;padding:10px 12px;'
                     f'border-bottom:1px solid var(--border);">'
                     f'<span style="font-size:18px;min-width:28px;text-align:center;">{medal}</span>'
                     f'<span style="font-size:22px;">{icon}</span>'
                     f'<div style="flex:1;min-width:0;">'
-                    f'<div style="font-weight:500;color:var(--text-primary);font-size:14px;">{cat}</div>'
-                    f'<div style="font-size:11px;color:var(--text-muted);font-family:monospace;">{rec["item_id"]}</div>'
+                    f'<div style="font-weight:500;color:var(--text-primary);font-size:14px;">{display_title}</div>'
+                    f'<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">'
+                    f'{meta_line}'
+                    f'{"  ·  " if meta_line and stars_html else ""}{stars_html}'
+                    f'{"  ·  " if (meta_line or stars_html) and price_html else ""}{price_html}'
                     f'</div>'
-                    f'<div style="width:120px;text-align:right;">'
+                    f'</div>'
+                    f'<div style="width:100px;text-align:right;">'
                     f'<div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-bottom:4px;">'
                     f'<div style="width:{pct}%;height:100%;background:{bar_color};border-radius:3px;"></div></div>'
                     f'<span style="font-size:12px;font-weight:600;color:var(--text-secondary);">{pct}%</span>'
@@ -396,7 +441,7 @@ def ask_question(question: str, product_id: str = ""):
                 f'<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:16px;">'
                 f'<div class="pipeline-step done">Embed Query<br><small>SentenceTransformer 384d · {embed_ms:.0f}ms</small></div>'
                 f'<span class="pipeline-arrow">→</span>'
-                f'<div class="pipeline-step done">Feast Vector Store<br><small>Milvus similarity · {search_ms:.0f}ms · {len(sources)} docs</small></div>'
+                f'<div class="pipeline-step done">Feast + Vector Store<br><small>Milvus similarity · {search_ms:.0f}ms · {len(sources)} docs</small></div>'
                 f'<span class="pipeline-arrow">→</span>'
                 f'<div class="pipeline-step done">Mistral-7B Generate<br><small>Contextual answer · {llm_ms:.0f}ms</small></div>'
                 f'</div>'

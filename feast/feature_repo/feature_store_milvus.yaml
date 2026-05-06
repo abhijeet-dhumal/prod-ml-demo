@@ -3,11 +3,11 @@
 # Execution model:
 #   Driver  : Feast pod (offline container) — already has registry PVC + S3 creds
 #   Executors: k8s:// executor pods using feast-spark-executor-embeddings image
-#              (RAPIDS GPU + sentence-transformers + all-MiniLM-L6-v2 baked in)
+#              (GPU + sentence-transformers + all-MiniLM-L6-v2 baked in)
 #
 # Flow:
 #   S3 raw parquet  →  SparkSource  →  @batch_feature_view  →  _embed() pandas UDF
-#   (sentence-transformers, GPU via RAPIDS on executor pods)  →  Milvus online store
+#   (sentence-transformers, GPU/CUDA on executor pods)  →  Milvus online store
 #
 # Run via Kubernetes Job (feast-materialize-embeddings-job.yaml):
 #   set -a; source .env; set +a
@@ -39,6 +39,7 @@ offline_store:
     spark.driver.extraJavaOptions: "-Dcom.redhat.fips=false"
     spark.sql.execution.arrow.pyspark.enabled: "true"
     spark.sql.execution.arrow.fallback.enabled: "true"
+    spark.sql.sources.useV1SourceList: "parquet,csv,json,text,orc"
     spark.hadoop.fs.s3a.endpoint: "http://minio.${NAMESPACE}.svc.cluster.local:9000"
     spark.hadoop.fs.s3a.path.style.access: "true"
     spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
@@ -82,12 +83,21 @@ batch_engine:
   spark.driver.port: "7077"
   spark.blockManager.port: "7078"
   spark.driver.memory: "8g"
-  # Executor sizing — mirrors spark-application-embedding.yaml
+  # Executor sizing
   spark.executor.instances: "4"
-  spark.executor.cores: "4"
-  spark.executor.memory: "16g"
-  spark.executor.memoryOverhead: "4g"
+  spark.executor.memory: "24g"
+  spark.executor.memoryOverhead: "8g"
   spark.executor.extraJavaOptions: "-Duser.dir=/tmp"
+  # GPU: sentence-transformers CUDA inference in pandas UDF on executor pods
+  spark.executor.resource.gpu.amount: "1"
+  spark.executor.resource.gpu.vendor: "nvidia.com"
+  spark.executor.resource.gpu.discoveryScript: "/opt/spark/getGpusResources.sh"
+  # Explicitly disable RAPIDS — the executor image has the JAR but it only accelerates
+  # Spark SQL ops, not pandas UDFs. It wastes GPU memory that PyTorch needs.
+  spark.rapids.sql.enabled: "false"
+  # 1 core per executor — one Python UDF worker per GPU avoids OOMKill
+  # from multiple concurrent sentence-transformers loads
+  spark.executor.cores: "1"
   spark.driver.extraJavaOptions: "-Duser.dir=/tmp -Dcom.redhat.fips=false"
   # HuggingFace model cache — baked into the executor image at /opt/hf-cache
   spark.executorEnv.HF_HOME: "/opt/hf-cache"
@@ -104,11 +114,11 @@ batch_engine:
   # Spark 3.4+ defaults parquet to V2 data source which blocks FROM parquet.`path` SQL syntax.
   # Force V1 source list so SparkSource query= (parquet.`s3a://...`) works.
   spark.sql.sources.useV1SourceList: "parquet,csv,json,text,orc"
-  spark.sql.shuffle.partitions: "200"
-  spark.default.parallelism: "200"
+  spark.sql.shuffle.partitions: "32"
+  spark.default.parallelism: "32"
   spark.sql.execution.arrow.pyspark.enabled: "true"
   spark.sql.execution.arrow.fallback.enabled: "true"
-  spark.sql.execution.arrow.maxRecordsPerBatch: "50000"
+  spark.sql.execution.arrow.maxRecordsPerBatch: "100000"
   # S3 / MinIO
   spark.hadoop.fs.s3a.endpoint: "http://minio.${NAMESPACE}.svc.cluster.local:9000"
   spark.hadoop.fs.s3a.path.style.access: "true"

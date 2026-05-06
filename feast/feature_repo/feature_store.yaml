@@ -77,9 +77,8 @@ batch_engine:
   # 10 partitions → 10 concurrent Redis pipeline connections.
   # 200 caused Redis OOMKill (512Mi default limit). Keep ≤10 unless Redis limit is raised further.
   partitions: 10
-  # local[*]: run Spark in the feast pod JVM. Avoids executor pod CreateContainerError
-  # (feast-server image lacks /opt/spark/bin/executor required by k8s:// driver mode).
-  # Switch to k8s:// once a proper Spark executor base image is configured.
+  # local[*] for user/item features (small data, runs in-pod).
+  # Embedding materialization uses feature_store_milvus.yaml with k8s:// distributed mode.
   spark.master: "local[*]"
   spark.driver.memory: "8g"
   spark.ui.enabled: "false"

@@ -1,15 +1,14 @@
-"""Feast feature definitions — Milvus-only slice.
+"""Feast feature definitions — Milvus embedding slice.
 
-Contains ONLY the review_embeddings @batch_feature_view and its dependencies.
-Used with feature_store_milvus.yaml to avoid feast apply trying to create
-Milvus collections for user_features / item_features (which have no vector field).
+Defines review_embeddings @batch_feature_view and its SparkSource.
+Separate from features.py (user/item → Redis) to keep Milvus-only
+materialization isolated.
 
 Flow:
-  raw_reviews_source (SparkSource, S3)
-      ↓  SparkComputeEngine  (k8s:// executor pods — feast-spark-executor-embeddings)
-  review_embeddings BFV  →  spark_embed() (sentence-transformers, GPU/RAPIDS)
-      ↓
-  Milvus online store  (384-dim COSINE index)
+  raw_reviews_source (SparkSource, S3 parquet)
+    → SparkComputeEngine (k8s:// GPU executor pods)
+      → _embed_udf: sentence-transformers all-MiniLM-L6-v2, 384-dim
+        → Milvus online store (IVF_FLAT COSINE index)
 """
 
 from datetime import timedelta
@@ -34,7 +33,12 @@ review = Entity(
 
 raw_reviews_source = SparkSource(
     name="raw_reviews_source",
-    query="SELECT *, CAST(timestamp / 1000 AS TIMESTAMP) AS event_timestamp FROM parquet.`s3a://smartshop-raw/raw/reviews/*/`",
+    query=(
+        "SELECT *, "
+        "CAST(timestamp / 1000 AS TIMESTAMP) AS event_timestamp, "
+        "SHA2(CONCAT_WS('_', user_id, COALESCE(parent_asin, asin), CAST(timestamp AS STRING)), 256) AS review_id "
+        "FROM parquet.`s3a://smartshop-raw/raw/reviews/*/`"
+    ),
     timestamp_field="event_timestamp",
 )
 
@@ -74,9 +78,10 @@ EMBEDDING_DIM = 384
     offline=False,
 )
 def review_embeddings(df):
+    import numpy as np
+    import pandas as pd
     from pyspark.sql import functions as F
-
-    from feast.infra.compute_engines.spark.utils import spark_embed
+    from pyspark.sql.types import ArrayType, FloatType
 
     if "asin" in df.columns and "parent_asin" not in df.columns:
         df = df.withColumnRenamed("asin", "parent_asin")
@@ -113,10 +118,14 @@ def review_embeddings(df):
         F.current_timestamp().alias("event_timestamp"),
     )
 
-    return spark_embed(
-        staging,
-        text_col="embed_text",
-        model=EMBEDDING_MODEL,
-        output_col="embedding",
-        batch_size=64,
-    )
+    @F.pandas_udf(ArrayType(FloatType()))
+    def _embed_udf(texts: pd.Series) -> pd.Series:
+        from sentence_transformers import SentenceTransformer
+
+        model = SentenceTransformer(EMBEDDING_MODEL)
+        embeddings = model.encode(
+            texts.tolist(), normalize_embeddings=True, batch_size=64, show_progress_bar=False
+        )
+        return pd.Series([e.tolist() for e in embeddings])
+
+    return staging.withColumn("embedding", _embed_udf(F.col("embed_text")))

@@ -15,7 +15,7 @@
 #   oc start-build feast-spark-executor-rapids -n smartshop --follow
 
 ARG REGISTRY
-FROM ${REGISTRY}/smartshop-feast-spark-executor:latest
+FROM ${REGISTRY}/smartshop/feast-spark-executor:latest
 
 USER 0
 

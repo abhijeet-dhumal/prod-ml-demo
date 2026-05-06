@@ -76,7 +76,6 @@ def compute_item_features(reviews_df, metadata_df):
         F.first("category").alias("category"),
     )
 
-    # Join with metadata for price info
     if metadata_df is not None:
         item_features = review_aggs.join(
             metadata_df.select(
@@ -84,20 +83,26 @@ def compute_item_features(reviews_df, metadata_df):
                 F.col("price").cast("float").alias("item_price"),
                 F.col("average_rating").alias("item_meta_rating"),
                 F.col("rating_number").alias("item_meta_rating_count"),
+                F.substring(F.col("title"), 1, 120).alias("item_title"),
+                F.col("store").alias("item_brand"),
+                F.col("main_category").alias("item_category"),
             ),
             on="parent_asin",
             how="left",
         )
     else:
-        item_features = review_aggs.withColumn("item_price", F.lit(None).cast("float"))
+        item_features = (
+            review_aggs
+            .withColumn("item_price", F.lit(None).cast("float"))
+            .withColumn("item_title", F.lit(None).cast("string"))
+            .withColumn("item_brand", F.lit(None).cast("string"))
+            .withColumn("item_category", F.lit(None).cast("string"))
+        )
 
-    # Price bucketing
     item_features = (
         item_features
         .withColumn("event_timestamp", F.current_timestamp())
-        # Rename to match Feast entity key — Feast entity is `item_id`, not `parent_asin`
         .withColumnRenamed("parent_asin", "item_id")
-        # Drop string columns not consumed by the TwoTower model
         .drop("item_price_bucket", "category", "item_meta_rating", "item_meta_rating_count")
     )
 

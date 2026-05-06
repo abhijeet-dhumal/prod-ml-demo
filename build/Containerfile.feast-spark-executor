@@ -1,9 +1,10 @@
 # feast-spark-executor — k8s:// distributed Spark executor image (CPU baseline)
 #
 # Extends feast-spark-server setup (UBI9/feature-server base) with:
+#   - Feast 0.63.0 from fork branch (same as feast-spark — driver/executor must match)
 #   - /opt/spark/{bin,jars,python} symlinks so the k8s driver can find executor scripts
 #     (driver launches executor pods via /opt/spark/bin/spark-class)
-#   - Same pyspark 3.5.3 + S3A JARs + BFV patches as feast-spark-server
+#   - pyspark 3.5.3 + S3A JARs
 #
 # This is the CPU BASELINE image — no RAPIDS, no GPU.
 # Used to benchmark: local[*] (single pod) vs k8s:// distributed workers (this image).
@@ -20,33 +21,18 @@ FROM quay.io/feastdev/feature-server:0.62.0
 
 USER 0
 
+# git: pip needs it for git+ install of the feast fork below.
 # Java 11 + FIPS disable (identical to Containerfile.feast-spark)
-RUN microdnf install -y java-11-openjdk-headless && microdnf clean all
+RUN microdnf install -y java-11-openjdk-headless git && microdnf clean all
 ENV JAVA_HOME=/usr/lib/jvm/jre-11
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 ENV JAVA_TOOL_OPTIONS="-Dcom.redhat.fips=false"
 
-# BFV + S3A bug patches — same 4 files as feast-spark (executor must have matching code)
-#   Bug 1: feature_builder.py — get_column_info() missing "python" mode guard  (PR #6310)
-#   Bug 2: spark.py — pull_all_from_table_or_query() missing SELECT * fallback  (PR #6311)
-#   Bug 3: spark/utils.py — full set of Spark compute engine fixes for vector store
-#            materialization (S3A event log init, SQL config reuse, getattr guard,
-#            map_in_pandas sentinel schema, write_to_online/offline_store helpers,
-#            spark_embed() utility with executor-local model singleton cache)
-#   Bug 4: spark/nodes.py — replace mapInArrow with foreachPartition in SparkWriteNode
-#            to avoid ArrowStreamPandasUDFSerializer mismatch when WindowGroupLimitExec
-#            is upstream in the physical plan (AttributeError: 'list' has no .dtype)
-RUN FEAST_SITE=$(python3 -c 'import feast, os; print(os.path.dirname(feast.__file__))') && \
-    FORK="https://raw.githubusercontent.com/abhijeet-dhumal/feast/feat/spark-vector-store-materialization/sdk/python" && \
-    curl -fsSL -o "${FEAST_SITE}/infra/compute_engines/feature_builder.py" \
-      "${FORK}/feast/infra/compute_engines/feature_builder.py" && \
-    curl -fsSL -o "${FEAST_SITE}/infra/offline_stores/contrib/spark_offline_store/spark.py" \
-      "${FORK}/feast/infra/offline_stores/contrib/spark_offline_store/spark.py" && \
-    curl -fsSL -o "${FEAST_SITE}/infra/compute_engines/spark/utils.py" \
-      "${FORK}/feast/infra/compute_engines/spark/utils.py" && \
-    curl -fsSL -o "${FEAST_SITE}/infra/compute_engines/spark/nodes.py" \
-      "${FORK}/feast/infra/compute_engines/spark/nodes.py" && \
-    echo "Patch applied OK"
+# Install Feast from fork branch (upstream 0.63.0 + Spark vector store materialization fixes).
+# Same version as feast-spark — driver and executor must have matching Feast code.
+# PRs pending merge at https://github.com/feast-dev/feast — switch to upstream once merged.
+RUN pip install --no-cache-dir \
+    "feast[spark] @ git+https://github.com/abhijeet-dhumal/feast.git@fix/spark-vector-store-materialization#subdirectory=sdk/python"
 
 # PySpark 3.5.3 (same pin as feast-spark — must match driver exactly)
 RUN pip install --no-cache-dir pyspark==3.5.3
