@@ -37,7 +37,7 @@ metadata:
     mode: medium
 spec:
   ttlSecondsAfterFinished: 86400   # keep logs for 24h after completion
-  backoffLimit: 1
+  backoffLimit: 3
   activeDeadlineSeconds: 7200      # 2-hour hard limit (15-30 min expected)
   template:
     spec:
@@ -58,6 +58,8 @@ spec:
               value: "5000000"        # 5M rows/category = 15M total (sweet spot for RAPIDS + QLoRA demo)
             - name: META_SAMPLE
               value: "200000"         # 200K metadata rows/category
+            - name: METADATA_ONLY
+              value: "true"           # skip reviews, only download missing metadata
           envFrom:
             - secretRef:
                 name: smartshop-credentials
@@ -131,6 +133,7 @@ data:
     CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 500_000))
     SAMPLE_N   = int(os.environ.get("SAMPLE_PER_CATEGORY", 333334))
     META_N     = int(os.environ.get("META_SAMPLE", 50000))
+    META_ONLY  = os.environ.get("METADATA_ONLY", "false").lower() == "true"
 
     MINIO_ENDPOINT = os.environ["MINIO_ENDPOINT"]
     S3_BUCKET  = "smartshop-raw"
@@ -150,7 +153,11 @@ data:
 
     def write_parquet_to_s3(rows: list, s3_path: str) -> int:
         """Convert rows list → Parquet and upload to S3. Returns bytes written."""
-        table = pa.Table.from_pandas(pd.DataFrame(rows), preserve_index=False)
+        df = pd.DataFrame(rows)
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].astype(str)
+        table = pa.Table.from_pandas(df, preserve_index=False)
         buf = io.BytesIO()
         pq.write_table(table, buf, compression="snappy")
         size = buf.tell()
@@ -224,35 +231,76 @@ data:
         all_files = list(list_repo_files(DATASET, repo_type="dataset", token=HF_TOKEN or None))
         shards = sorted(f for f in all_files
                         if f.startswith(f"raw_meta_{category}/") and f.endswith(".parquet"))
-        if not shards:
-            print(f"  [{category}] no metadata shards found — skipping")
-            return
 
-        print(f"  [{category}] found {len(shards)} shard(s)")
-        collected = 0
+        if shards:
+            print(f"  [{category}] found {len(shards)} parquet shard(s)")
+            collected = 0
+            for i, shard in enumerate(shards):
+                local = hf_hub_download(repo_id=DATASET, filename=shard,
+                                        repo_type="dataset", token=HF_TOKEN or None)
+                df = pd.read_parquet(local)
 
-        for i, shard in enumerate(shards):
-            local = hf_hub_download(repo_id=DATASET, filename=shard,
-                                    repo_type="dataset", token=HF_TOKEN or None)
-            df = pd.read_parquet(local)
+                if MODE == "sample":
+                    remaining = META_N - collected
+                    if remaining <= 0:
+                        break
+                    df = df.head(remaining)
 
-            if MODE == "sample":
-                remaining = META_N - collected
-                if remaining <= 0:
+                if MODE == "full":
+                    dest = f"{S3_BUCKET}/raw/metadata/{category}_meta/part-{i:04d}.parquet"
+                else:
+                    dest = f"{S3_BUCKET}/raw/metadata/{category}_meta.parquet"
+
+                write_parquet_to_s3(df.to_dict("records"), dest)
+                collected += len(df)
+                print(f"  [{category}] shard {i+1}/{len(shards)}: {len(df):,} rows → {dest}")
+
+                if MODE == "sample" and collected >= META_N:
                     break
-                df = df.head(remaining)
+        else:
+            jsonl_path = f"raw/meta_categories/meta_{category}.jsonl"
+            if jsonl_path not in all_files:
+                print(f"  [{category}] no metadata found (parquet or JSONL) — skipping")
+                elapsed = time.time() - t0
+                print(f"[{category}] metadata skipped in {elapsed:.1f}s")
+                return
 
-            if MODE == "full":
-                dest = f"{S3_BUCKET}/raw/metadata/{category}_meta/part-{i:04d}.parquet"
-            else:
-                dest = f"{S3_BUCKET}/raw/metadata/{category}_meta.parquet"
+            print(f"  [{category}] no parquet shards, falling back to JSONL: {jsonl_path}")
+            url = hf_resolve_url(jsonl_path)
+            headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+            rows: list = []
+            collected = 0
+            part = 0
 
-            write_parquet_to_s3(df.to_dict("records"), dest)
-            collected += len(df)
-            print(f"  [{category}] shard {i+1}/{len(shards)}: {len(df):,} rows → {dest}")
+            with requests.get(url, headers=headers, stream=True, timeout=600) as resp:
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines():
+                    if not raw_line:
+                        continue
+                    rows.append(json.loads(raw_line))
+                    collected += 1
 
-            if MODE == "sample" and collected >= META_N:
-                break
+                    if collected % 50_000 == 0:
+                        print(f"  [{category}] metadata {collected:,} rows streamed...")
+
+                    if len(rows) >= CHUNK_SIZE:
+                        if MODE == "full":
+                            dest = f"{S3_BUCKET}/raw/metadata/{category}_meta/part-{part:04d}.parquet"
+                        else:
+                            dest = f"{S3_BUCKET}/raw/metadata/{category}_meta.parquet"
+                        write_parquet_to_s3(rows, dest)
+                        rows = []
+                        part += 1
+
+                    if MODE == "sample" and collected >= META_N:
+                        break
+
+            if rows:
+                if MODE == "full":
+                    dest = f"{S3_BUCKET}/raw/metadata/{category}_meta/part-{part:04d}.parquet"
+                else:
+                    dest = f"{S3_BUCKET}/raw/metadata/{category}_meta.parquet"
+                write_parquet_to_s3(rows, dest)
 
         elapsed = time.time() - t0
         print(f"[{category}] metadata done: {collected:,} rows in {elapsed:.1f}s")
@@ -261,7 +309,8 @@ data:
     if __name__ == "__main__":
         grand_start = time.time()
         for cat in CATEGORIES:
-            download_reviews(cat)
+            if not META_ONLY:
+                download_reviews(cat)
             download_metadata(cat)
         total_elapsed = time.time() - grand_start
         print(f"\n=== Download complete | total time: {total_elapsed/60:.1f} min ===")

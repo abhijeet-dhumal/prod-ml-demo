@@ -161,20 +161,57 @@ def item_features(df):
     )
 
     try:
-        spark = df.sparkSession
-        metadata_df = spark.read.parquet("s3a://smartshop-raw/raw/metadata/")
-        item_feats = review_aggs.join(
-            metadata_df.select(
-                F.col("parent_asin"),
-                F.col("price").cast("float").alias("item_price"),
-                F.substring(F.col("title"), 1, 120).alias("item_title"),
-                F.col("store").alias("item_brand"),
-                F.col("main_category").alias("item_category"),
+        import os, boto3, pyarrow.parquet as pq, io, sys
+
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=os.environ.get(
+                "FEAST_S3_ENDPOINT_URL", "http://minio.smartshop.svc.cluster.local:9000"
             ),
-            on="parent_asin",
-            how="left",
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", "minio"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minio123"),
         )
-    except Exception:
+        meta_tables = []
+        for key in [
+            "raw/metadata/Electronics_meta.parquet",
+            "raw/metadata/Books_meta.parquet",
+            "raw/metadata/Home_and_Kitchen_meta.parquet",
+        ]:
+            try:
+                obj = s3.get_object(Bucket="smartshop-raw", Key=key)
+                tbl = pq.read_table(
+                    io.BytesIO(obj["Body"].read()),
+                    columns=["parent_asin", "title", "main_category", "price", "store", "author"],
+                )
+                meta_tables.append(tbl)
+            except Exception:
+                pass
+
+        if meta_tables:
+            import pyarrow as pa
+
+            meta_arrow = pa.concat_tables(meta_tables, promote_options="permissive")
+            meta_pdf = meta_arrow.to_pandas()
+            meta_pdf["item_brand"] = meta_pdf["store"].fillna(meta_pdf["author"])
+            meta_pdf["item_price"] = meta_pdf["price"].astype(str)
+            meta_pdf = meta_pdf[["parent_asin", "title", "main_category", "item_price", "item_brand"]]
+            meta_pdf.columns = ["parent_asin", "item_title", "item_category", "item_price", "item_brand"]
+
+            spark = df.sparkSession
+            metadata_sdf = spark.createDataFrame(meta_pdf)
+            print(f"[item_features] metadata loaded: {len(meta_pdf)} rows via boto3", file=sys.stderr)
+
+            item_feats = review_aggs.join(
+                metadata_sdf,
+                on="parent_asin",
+                how="left",
+            )
+        else:
+            raise RuntimeError("No metadata files found in S3")
+
+    except Exception as e:
+        import sys
+        print(f"[item_features] metadata join failed: {e}", file=sys.stderr)
         item_feats = (
             review_aggs
             .withColumn("item_price", F.lit(None).cast("float"))
