@@ -2,12 +2,13 @@
 
 Loads the Two-Tower model with ID mappings from the training checkpoint
 and serves real-time product recommendations. Enriches results with
-product metadata (title, brand, category, rating, price) from Feast.
+product metadata (title, brand, category, rating, price) from Feast
+and user profile features for persona context.
 
 Endpoints:
     POST /v1/models/smartshop-rec:predict
-    Body: {"user_id": "...", "candidate_items": ["ASIN1", "ASIN2", ...], "top_k": 10}
-    Response: {"recommendations": [{"item_id": "...", "score": 0.95, "title": "...", ...}, ...]}
+    POST /v1/models/smartshop-rec:user-profile
+    GET  /health
 """
 
 import os
@@ -17,6 +18,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as tnf
 from fastapi import FastAPI
 from prometheus_client import Counter, Histogram, make_asgi_app
 from pydantic import BaseModel
@@ -35,7 +37,7 @@ CANDIDATES_SCORED = Histogram(
 
 
 class TwoTower(nn.Module):
-    """Matches the architecture produced by 01_training_rec.ipynb."""
+    """Matches the architecture produced by 02_training.ipynb train_fn."""
 
     def __init__(self, n_users: int, n_items: int, embed_dim: int = 64, hidden_dim: int = 256):
         super().__init__()
@@ -65,13 +67,23 @@ _all_item_embeddings: Optional[torch.Tensor] = None
 _all_item_indices: Optional[torch.Tensor] = None
 _feast_store = None
 
-ITEM_FEATURES = [
+ITEM_DISPLAY_FEATURES = [
     "item_metadata:item_title",
     "item_metadata:item_brand",
     "item_metadata:item_category",
     "item_features:item_avg_rating",
+    "item_features:item_review_count",
     "item_metadata:item_price",
 ]
+
+USER_PROFILE_FEATURES = [
+    "user_features:user_avg_rating",
+    "user_features:user_review_count",
+    "user_features:user_primary_category",
+    "user_features:user_tenure_days",
+]
+
+_OVER_FETCH_FACTOR = 10
 
 
 @asynccontextmanager
@@ -109,7 +121,7 @@ async def lifespan(app: FastAPI):
         if fs.isdir(model_path):
             model_path = model_path.rstrip("/") + "/best_model.pt"
         local_path = "/tmp/best_model.pt"
-        print(f"Downloading {model_path} → {local_path}")
+        print(f"Downloading {model_path} -> {local_path}")
         fs.get(model_path, local_path)
         model_path = local_path
 
@@ -117,8 +129,8 @@ async def lifespan(app: FastAPI):
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
-        n_users = checkpoint["n_users"]
-        n_items = checkpoint["n_items"]
+        n_users = checkpoint.get("n_users", checkpoint.get("num_users"))
+        n_items = checkpoint.get("n_items", checkpoint.get("num_items"))
         embed_dim = checkpoint.get("embed_dim", 64)
         hidden_dim = checkpoint.get("hidden_dim", 256)
         _user_to_idx = checkpoint.get("user_to_idx", {})
@@ -139,7 +151,9 @@ async def lifespan(app: FastAPI):
 
     with torch.no_grad():
         _all_item_indices = torch.arange(n_items, dtype=torch.long)
-        _all_item_embeddings = _model.item_mlp(_model.item_embed(_all_item_indices))
+        _all_item_embeddings = tnf.normalize(
+            _model.item_mlp(_model.item_embed(_all_item_indices)), p=2, dim=-1,
+        )
 
     print(f"Model loaded: {n_users} users, {n_items} items, "
           f"embed_dim={embed_dim}, hidden_dim={hidden_dim}, "
@@ -160,6 +174,16 @@ class RecommendRequest(BaseModel):
 
 class RecommendResponse(BaseModel):
     recommendations: list[dict]
+    num_scored: int = 0
+
+
+class UserProfileRequest(BaseModel):
+    user_id: str
+
+
+class UserProfileResponse(BaseModel):
+    user_id: str
+    profile: dict
 
 
 def _enrich_with_feast(results: list[dict]) -> list[dict]:
@@ -169,15 +193,20 @@ def _enrich_with_feast(results: list[dict]) -> list[dict]:
     try:
         entity_rows = [{"item_id": r["item_id"]} for r in results]
         features = _feast_store.get_online_features(
-            features=ITEM_FEATURES, entity_rows=entity_rows,
+            features=ITEM_DISPLAY_FEATURES, entity_rows=entity_rows,
         ).to_dict()
         for i, rec in enumerate(results):
-            rec["title"] = features.get("item_title", [None] * len(results))[i] or ""
-            rec["brand"] = features.get("item_brand", [None] * len(results))[i] or ""
-            rec["category"] = features.get("item_category", [None] * len(results))[i] or ""
+            title = features.get("item_title", [None] * len(results))[i]
+            rec["title"] = title if title else ""
+            brand = features.get("item_brand", [None] * len(results))[i]
+            rec["brand"] = brand if brand else ""
+            cat = features.get("item_category", [None] * len(results))[i]
+            rec["category"] = cat if cat else ""
             rec["avg_rating"] = features.get("item_avg_rating", [None] * len(results))[i]
+            rec["review_count"] = features.get("item_review_count", [None] * len(results))[i]
             price = features.get("item_price", [None] * len(results))[i]
             rec["price"] = round(price, 2) if price else None
+            rec["has_metadata"] = bool(title)
     except Exception as e:
         print(f"Feast enrichment failed: {e}")
     return results
@@ -194,36 +223,70 @@ def predict(request: RecommendRequest):
 
         with torch.no_grad():
             user_t = torch.tensor([user_idx], dtype=torch.long)
-            user_emb = _model.user_mlp(_model.user_embed(user_t))
+            user_emb = tnf.normalize(
+                _model.user_mlp(_model.user_embed(user_t)), p=2, dim=-1,
+            )
 
             if request.candidate_items:
                 idxs = [_item_to_idx.get(iid, 0) for iid in request.candidate_items]
                 item_t = torch.tensor(idxs, dtype=torch.long)
-                item_embs = _model.item_mlp(_model.item_embed(item_t))
+                item_embs = tnf.normalize(
+                    _model.item_mlp(_model.item_embed(item_t)), p=2, dim=-1,
+                )
                 scores_t = torch.sigmoid((user_emb * item_embs).sum(dim=1))
                 item_ids = request.candidate_items
+                num_scored = len(item_ids)
             else:
                 scores_t = torch.sigmoid((user_emb * _all_item_embeddings).sum(dim=1))
                 item_ids = None
+                num_scored = scores_t.shape[0]
 
-            top_k = min(request.top_k, scores_t.shape[0])
-            top_scores, top_indices = torch.topk(scores_t, top_k)
+            fetch_k = min(request.top_k * _OVER_FETCH_FACTOR, scores_t.shape[0])
+            top_scores, top_indices = torch.topk(scores_t, fetch_k)
 
         raw_results = []
         for score, idx in zip(top_scores.tolist(), top_indices.tolist()):
             iid = item_ids[idx] if item_ids else _idx_to_item.get(idx, str(idx))
             raw_results.append({"item_id": iid, "score": round(score, 4)})
 
-        results = _enrich_with_feast(raw_results)
+        enriched = _enrich_with_feast(raw_results)
 
-        CANDIDATES_SCORED.observe(scores_t.shape[0])
+        # R2: prefer items with metadata, fill remainder with un-enriched items
+        with_meta = [r for r in enriched if r.get("has_metadata")]
+        without_meta = [r for r in enriched if not r.get("has_metadata")]
+        final = with_meta[:request.top_k]
+        if len(final) < request.top_k:
+            final.extend(without_meta[:request.top_k - len(final)])
+
+        CANDIDATES_SCORED.observe(num_scored)
         REQUESTS_TOTAL.labels(status="ok").inc()
-        return RecommendResponse(recommendations=results)
+        return RecommendResponse(recommendations=final, num_scored=num_scored)
     except Exception as e:
         REQUESTS_TOTAL.labels(status="error").inc()
         raise e
     finally:
         REQUEST_DURATION.observe(time.perf_counter() - t0)
+
+
+@app.post("/v1/models/smartshop-rec:user-profile", response_model=UserProfileResponse)
+def user_profile(request: UserProfileRequest):
+    """Return Feast user features for persona context display."""
+    profile = {}
+    if _feast_store:
+        try:
+            features = _feast_store.get_online_features(
+                features=USER_PROFILE_FEATURES,
+                entity_rows=[{"user_id": request.user_id}],
+            ).to_dict()
+            profile = {
+                "avg_rating": features.get("user_avg_rating", [None])[0],
+                "review_count": features.get("user_review_count", [None])[0],
+                "primary_category": features.get("user_primary_category", [None])[0],
+                "tenure_days": features.get("user_tenure_days", [None])[0],
+            }
+        except Exception as e:
+            print(f"User profile lookup failed: {e}")
+    return UserProfileResponse(user_id=request.user_id, profile=profile)
 
 
 @app.get("/health")
@@ -232,4 +295,6 @@ def health():
         "status": "healthy",
         "model_loaded": _model is not None,
         "has_mappings": bool(_user_to_idx),
+        "num_items": len(_all_item_ids),
+        "feast_connected": _feast_store is not None,
     }

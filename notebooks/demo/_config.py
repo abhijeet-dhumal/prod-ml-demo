@@ -43,7 +43,7 @@ FEAST_TLS_CERT = os.environ.get(
 # Read-only client config with remote endpoints for offline/online/registry.
 FEAST_CLIENT_CONFIG = f"/opt/app-root/src/feast-config/{NAMESPACE}"
 FEAST_FEATURE_REPO_ON_POD = "/feast-data/smartshop/feast/feature_repo"
-MATERIALIZE_START = "2020-01-01T00:00:00"
+MATERIALIZE_START = "2016-01-01T00:00:00"
 
 # ── K8s Secret names ────────────────────────────────────────────────
 S3_CREDENTIALS_SECRET = "smartshop-credentials"

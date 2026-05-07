@@ -17,7 +17,7 @@ See [Admin Setup Runbook](#admin-setup-runbook) below for first-time cluster pro
 | # | Notebook | What it does | Time |
 |---|----------|-------------|------|
 | 0 | `00_setup.ipynb` | Pre-flight checks: infra connectivity, secrets, Feast config, pod readiness | ~1 min |
-| 1 | `01_data_pipeline.ipynb` | `feast materialize` with `@batch_feature_view` UDFs — raw S3 → user/item features in Redis (SparkComputeEngine + RAPIDS) | ~30 min |
+| 1 | `01_data_pipeline.ipynb` | `feast materialize` with `@batch_feature_view` UDFs — raw S3 → user/item/interaction features in Redis + S3 offline (SparkComputeEngine + RAPIDS) | ~30 min |
 | 2 | `02_training.ipynb` | Train Two-Tower rec model (DDP) + fine-tune Mistral-7B (QLoRA/FSDP) via Kubeflow TrainJob | ~2 hr |
 | 3 | `03_embeddings.ipynb` | `feast materialize` review embeddings → Milvus via Spark + sentence-transformers on GPU executors | ~45 min |
 | 4 | `04_serving.ipynb` | Deploy rec, LLM, RAG InferenceServices via KServe + smoke tests | ~10 min |
@@ -36,9 +36,9 @@ demo/
 ├── 04_serving.ipynb                    # KServe deploy + smoke tests
 │
 ├── feature_repo/                       # Feast feature definitions
-│   ├── features.py                     #   @batch_feature_view: user + item features (→ Redis)
+│   ├── features.py                     #   @batch_feature_view: user + item + interactions (→ Redis + S3)
 │   ├── features_milvus.py              #   review_embeddings (→ Milvus)
-│   ├── feature_store.yaml              #   main config (Spark + Redis)
+│   ├── feature_store.yaml              #   main config (Spark k8s:// RAPIDS + Redis)
 │   ├── feature_store_milvus.yaml       #   Milvus online store config
 │   └── feature_store_serving.yaml      #   serving-time config (no Spark)
 │
@@ -49,8 +49,7 @@ demo/
 │
 └── manifests/                          # OpenShift manifests (admin-managed)
     ├── feast-operator.yaml             #   FeatureStore CR
-    ├── feast-spark-engine.yaml         #   Feast batch engine ConfigMap + Spark secret
-    ├── feast-spark-engine-rapids.yaml  #   Feast Spark engine (RAPIDS GPU variant)
+    ├── feast-spark-engine.yaml         #   Feast batch engine ConfigMap (k8s:// RAPIDS) + Spark secret
     ├── feast-spark-driver-svc.yaml     #   Spark driver ClusterIP Service
     ├── serving-runtimes.yaml           #   vLLM + rec ServingRuntimes + InferenceServices
     ├── data-download-job.yaml          #   HuggingFace → S3 download Job template
@@ -90,23 +89,26 @@ Open `00_setup.ipynb` and run all cells. This verifies:
 
 **Notebook 1 — Data Pipeline**
 - Prerequisite: raw data already in S3 (data-download Job run by admin)
-- Runs `feast apply` + `feast materialize` on the Feast pod's offline container
+- Runs `feast apply` + `feast materialize` on the Feast pod's registry container
 - Feast `@batch_feature_view` UDFs define PySpark transformations inline
-- SparkComputeEngine (RAPIDS GPU) reads raw S3 data, computes features, writes to Redis directly
+- SparkComputeEngine reads raw S3 data, computes features, writes to Redis + S3 offline parquet
+- Feature views: `user_features`, `item_features`, `item_metadata`, `interactions`
 
 ```mermaid
 flowchart LR
-    Raw["S3: raw/reviews\nraw/metadata"] -->|"feast materialize\n@batch_feature_view UDFs\nSpark + RAPIDS GPU"| Redis["Redis\nonline store"]
+    Raw["S3: raw/reviews\nraw/metadata"] -->|"feast materialize\n@batch_feature_view UDFs\nSpark k8s:// + RAPIDS GPU"| Redis["Redis\nonline store"]
+    Raw -->|"offline=True"| S3["S3: offline/\nuser_features/\nitem_features/\ninteractions/"]
 ```
 
 **Notebook 2 — Training**
 - Submits Two-Tower recommendation model training via Kubeflow TrainJob (4 nodes × 2 GPUs, PyTorch DDP)
+- Training reads from Feast-materialized S3 offline parquet (`offline/interactions/`, `offline/user_features/`, `offline/item_features/`)
 - Submits Mistral-7B LoRA fine-tuning via Kubeflow TrainJob (4 nodes × 2 GPUs, QLoRA + FSDP)
 - Models saved to S3 **before** evaluation to prevent loss on eval failure
 
 ```mermaid
 flowchart LR
-    Raw["S3: raw data +\nRedis features"] --> RecTrain["Kubeflow TrainJob\nTwo-Tower DDP\n4×2 A100"]
+    Raw["S3: offline/interactions\n+ offline/user_features"] --> RecTrain["Kubeflow TrainJob\nTwo-Tower DDP\n4×2 A100"]
     RecTrain -->|"best_model.pt"| S3M["S3: smartshop-models/"]
     LLMData["S3: llm_data/"] --> LLMTrain["Kubeflow TrainJob\nMistral-7B QLoRA+FSDP\n4×2 A100"]
     LLMTrain -->|"LoRA adapter"| S3M
@@ -164,12 +166,13 @@ flowchart TD
     end
 
     subgraph Feast["Feast — Single Orchestrator"]
-        BFV["@batch_feature_view UDFs\nuser_features + item_features\n(PySpark transforms)"]
+        BFV["@batch_feature_view UDFs\nuser · item · interactions\n(PySpark transforms)"]
         EmbBFV["@batch_feature_view UDF\nreview_embeddings\n(sentence-transformers)"]
         Engine["SparkComputeEngine\nk8s:// + RAPIDS GPU"]
     end
 
-    Raw --> BFV --> Engine -->|"feast materialize"| Redis["Redis\nonline store"]
+    Raw --> BFV --> Engine -->|"feast materialize\nonline + offline"| Redis["Redis\nonline store"]
+    Engine -->|"offline=True"| S3Off["S3: offline/\ninteractions · features"]
     Raw --> EmbBFV --> Engine -->|"feast materialize"| Milvus["Milvus\nvector store"]
 
     subgraph Training["Kubeflow TrainJob (Distributed)"]
@@ -177,7 +180,7 @@ flowchart TD
         LLMTrain["Mistral-7B QLoRA+FSDP\n4×2 A100"]
     end
 
-    Raw --> RecTrain -->|"best_model.pt"| Models
+    S3Off -->|"offline/interactions\n+ features"| RecTrain -->|"best_model.pt"| Models
     Raw --> LLMTrain -->|"LoRA adapter"| Models
 
     subgraph Serving["KServe InferenceServices"]
@@ -246,8 +249,8 @@ oc apply -f manifests/service-ca-configmap.yaml
 ### 4. Deploy Feast
 
 ```bash
-# Spark engine ConfigMap (RAPIDS GPU variant)
-envsubst < manifests/feast-spark-engine-rapids.yaml | oc apply -f -
+# Spark engine ConfigMap (k8s:// RAPIDS GPU mode)
+envsubst < manifests/feast-spark-engine.yaml | oc apply -f -
 
 # Spark driver Service (stable host for executor→driver comms)
 envsubst < manifests/feast-spark-driver-svc.yaml | oc apply -f -
@@ -297,10 +300,14 @@ The `JAVA_HOME` path is already set in NB03's `%%yaml parameters` block.
 | Symptom | Fix |
 |---------|-----|
 | `feast materialize` hangs | Check Spark executors: `oc get pods -l feast-job=materialize -n smartshop` |
-| Executor `OOMKilled` | Increase `spark.executor.memory` in `feast-spark-engine` ConfigMap |
+| Executor `OOMKilled` (exit 137) | Increase `spark.executor.memoryOverhead` (not heap) — RAPIDS + Python UDFs need overhead. Current: 6g heap + 14g overhead = 20Gi |
+| Python `MemoryError` in `_write_partition` | Increase `batch_engine.partitions` (200+). Feast's `list(rows)` loads entire partition into Python memory |
+| `ConnectionResetError` from Redis | Reduce concurrent writers: fewer executor cores or increase Redis `maxclients` |
 | Executor `ImagePullBackOff` | Verify `spark.kubernetes.container.image` in ConfigMap points to accessible registry |
 | `ConnectionRefused` on Feast offline store | Restart Feast pod: `oc delete pod -l feast.dev/name=smartshop-feast -n smartshop` |
+| Spark driver port conflict (7078/7079) | Kill orphaned `python3`/`java` processes in Feast pod, force-delete stale executor pods |
 | `gRPC resource exhausted` | Don't call `store.materialize()` from notebook — use K8s exec on Feast pod |
 | Item features `None` after materialize | Verify `features.py` on Feast pod matches local copy (`oc exec ... cat /feast-data/.../features.py`) |
+| `UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY` | Ensure `spark.sql.runSQLOnFiles: "true"` is in both `offline_store` and `batch_engine` spark_conf |
 | KServe ISVC stuck `Unknown` | Check `oc describe isvc <name>` and `oc get events --sort-by=.lastTimestamp` |
 | vLLM OOM on base model | Reduce `--max-model-len` or increase GPU memory in ServingRuntime |

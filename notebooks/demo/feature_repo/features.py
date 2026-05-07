@@ -6,10 +6,12 @@ Pipeline:
   @batch_feature_view transformation UDFs
       |
   Redis online store  (online=True)
-  (no write-back to raw source -- offline=False)
+  S3 offline store    (offline=True, path=s3a://smartshop-features/offline/...)
+      |
+  get_historical_features reads pre-computed offline parquet for training data
 
 Feature views:
-  user_features  — per-user review aggregates (from reviews)
+  user_features  — per-user review aggregates + category preference (from reviews)
   item_features  — per-item review aggregates (from reviews)
   item_metadata  — product catalog fields    (from metadata)
 """
@@ -44,38 +46,79 @@ item = Entity(
 
 # ---------------------------------------------------------------------------
 # Sources
+#
+# Each BFV needs its own source because offline write-back (offline=True)
+# writes UDF output to batch_source.path. Different BFVs produce different
+# schemas, so each needs a unique offline destination.
+#
+# query = raw data input for UDF execution during materialization
+# path  = offline write destination + get_historical_features read source
 # ---------------------------------------------------------------------------
 
-raw_reviews_source = SparkSource(
-    name="raw_reviews_source",
-    query=(
-        "SELECT *, CAST(timestamp / 1000 AS TIMESTAMP) AS event_timestamp "
-        "FROM parquet.`s3a://smartshop-raw/raw/reviews/*/`"
-    ),
+_REVIEWS_QUERY = (
+    "SELECT *, CAST(timestamp / 1000 AS TIMESTAMP) AS event_timestamp "
+    "FROM parquet.`s3a://smartshop-raw/raw/reviews/*/`"
+)
+
+user_reviews_source = SparkSource(
+    name="user_reviews_source",
+    query=_REVIEWS_QUERY,
+    path="s3a://smartshop-features/offline/user_features/",
+    file_format="parquet",
     timestamp_field="event_timestamp",
 )
 
-# Each sub-SELECT reads one metadata file independently (no schema merge).
-# TIMESTAMP('2020-01-01') ensures metadata is always available for
-# point-in-time historical joins (metadata ts <= entity event_ts).
+item_reviews_source = SparkSource(
+    name="item_reviews_source",
+    query=_REVIEWS_QUERY,
+    path="s3a://smartshop-features/offline/item_features/",
+    file_format="parquet",
+    timestamp_field="event_timestamp",
+)
+
+interactions_source = SparkSource(
+    name="interactions_source",
+    query=_REVIEWS_QUERY,
+    path="s3a://smartshop-features/offline/interactions/",
+    file_format="parquet",
+    timestamp_field="event_timestamp",
+)
+
 raw_metadata_source = SparkSource(
     name="raw_metadata_source",
     query=(
-        "SELECT parent_asin, title, main_category, "
-        "CAST(price AS FLOAT) AS price, store AS brand, "
+        "SELECT parent_asin, title, "
+        "CASE WHEN main_category IN ('None', '') THEN 'Electronics' "
+        "     ELSE main_category END AS main_category, "
+        "CASE WHEN price IS NOT NULL AND CAST(price AS STRING) NOT IN ('None', 'nan') "
+        "     THEN CAST(price AS FLOAT) END AS price, "
+        "CASE WHEN store IS NOT NULL AND CAST(store AS STRING) != 'None' "
+        "     THEN store END AS brand, "
         "TIMESTAMP('2020-01-01') AS event_timestamp "
         "FROM parquet.`s3a://smartshop-raw/raw/metadata/Electronics_meta/` "
         "UNION ALL "
-        "SELECT parent_asin, title, main_category, "
-        "CAST(price AS FLOAT) AS price, author AS brand, "
+        "SELECT parent_asin, title, "
+        "CASE WHEN main_category IN ('None', '') THEN 'Books' "
+        "     ELSE main_category END AS main_category, "
+        "CASE WHEN price IS NOT NULL AND CAST(price AS STRING) NOT IN ('None', 'nan') "
+        "     THEN CAST(price AS FLOAT) END AS price, "
+        "CASE WHEN store IS NOT NULL AND CAST(store AS STRING) != 'None' "
+        "     THEN store END AS brand, "
         "TIMESTAMP('2020-01-01') AS event_timestamp "
         "FROM parquet.`s3a://smartshop-raw/raw/metadata/Books_meta.parquet` "
         "UNION ALL "
-        "SELECT parent_asin, title, main_category, "
-        "CAST(price AS FLOAT) AS price, CAST(NULL AS STRING) AS brand, "
+        "SELECT parent_asin, title, "
+        "CASE WHEN main_category IN ('None', '') THEN 'Home & Kitchen' "
+        "     ELSE main_category END AS main_category, "
+        "CASE WHEN price IS NOT NULL AND CAST(price AS STRING) NOT IN ('None', 'nan') "
+        "     THEN CAST(price AS FLOAT) END AS price, "
+        "CASE WHEN store IS NOT NULL AND CAST(store AS STRING) != 'None' "
+        "     THEN store END AS brand, "
         "TIMESTAMP('2020-01-01') AS event_timestamp "
         "FROM parquet.`s3a://smartshop-raw/raw/metadata/Home_and_Kitchen_meta.parquet`"
     ),
+    path="s3a://smartshop-features/offline/item_metadata/",
+    file_format="parquet",
     timestamp_field="event_timestamp",
 )
 
@@ -99,34 +142,52 @@ raw_metadata_source = SparkSource(
         Field(name="user_avg_review_length", dtype=Float64),
         Field(name="user_category_count", dtype=Int64),
         Field(name="user_tenure_days", dtype=Int64),
+        Field(name="user_primary_category", dtype=String),
     ],
-    source=raw_reviews_source,
+    source=user_reviews_source,
     mode=TransformationMode.PYTHON,
     online=True,
-    offline=False,
+    offline=True,
 )
 def user_features(df):
     from pyspark.sql import functions as F
+    from pyspark.sql import Window
 
     if "asin" in df.columns and "parent_asin" not in df.columns:
         df = df.withColumnRenamed("asin", "parent_asin")
     if "helpful_vote" not in df.columns:
         df = df.withColumn("helpful_vote", F.lit(0))
-    if "category" not in df.columns:
-        df = df.withColumn("category", F.input_file_name())
 
-    return (
+    df = df.filter(F.col("rating") > 0)
+
+    df = df.withColumn(
+        "category",
+        F.regexp_extract(F.input_file_name(), r"/reviews/([^/]+)/", 1),
+    )
+
+    user_cat_counts = (
+        df.groupBy("user_id", "category")
+        .agg(F.count("*").alias("cat_count"))
+    )
+    w = Window.partitionBy("user_id").orderBy(F.desc("cat_count"))
+    user_primary = (
+        user_cat_counts
+        .withColumn("rn", F.row_number().over(w))
+        .filter(F.col("rn") == 1)
+        .select("user_id", F.col("category").alias("user_primary_category"))
+    )
+
+    user_aggs = (
         df.groupBy("user_id")
         .agg(
             F.avg("rating").alias("user_avg_rating"),
             F.count("*").alias("user_review_count"),
             F.countDistinct("parent_asin").alias("user_unique_items"),
             F.avg(F.length("text")).alias("user_avg_review_length"),
-            F.collect_set("category").alias("user_categories"),
+            F.countDistinct("category").alias("user_category_count"),
             F.max("timestamp").alias("user_last_active"),
             F.min("timestamp").alias("user_first_active"),
         )
-        .withColumn("user_category_count", F.size("user_categories"))
         .withColumn(
             "user_tenure_days",
             (
@@ -134,7 +195,11 @@ def user_features(df):
                 / 86_400_000
             ).cast("int"),
         )
-        .drop("user_categories", "user_last_active", "user_first_active")
+        .drop("user_last_active", "user_first_active")
+    )
+
+    return (
+        user_aggs.join(user_primary, on="user_id", how="left")
         .withColumn("event_timestamp", F.current_timestamp())
     )
 
@@ -158,10 +223,10 @@ def user_features(df):
         Field(name="item_total_helpful_votes", dtype=Int64),
         Field(name="item_avg_review_length", dtype=Float64),
     ],
-    source=raw_reviews_source,
+    source=item_reviews_source,
     mode=TransformationMode.PYTHON,
     online=True,
-    offline=False,
+    offline=True,
 )
 def item_features(df):
     from pyspark.sql import functions as F
@@ -170,6 +235,8 @@ def item_features(df):
         df = df.withColumnRenamed("asin", "parent_asin")
     if "helpful_vote" not in df.columns:
         df = df.withColumn("helpful_vote", F.lit(0))
+
+    df = df.filter(F.col("rating") > 0)
 
     return (
         df.groupBy("parent_asin")
@@ -206,7 +273,7 @@ def item_features(df):
     source=raw_metadata_source,
     mode=TransformationMode.PYTHON,
     online=True,
-    offline=False,
+    offline=True,
 )
 def item_metadata(df):
     from pyspark.sql import functions as F
@@ -216,9 +283,47 @@ def item_metadata(df):
             F.col("parent_asin").alias("item_id"),
             F.col("title").alias("item_title"),
             F.col("main_category").alias("item_category"),
-            F.col("price").alias("item_price"),
+            F.col("price").cast("float").alias("item_price"),
             F.col("brand").alias("item_brand"),
         )
         .dropDuplicates(["item_id"])
         .withColumn("event_timestamp", F.current_timestamp())
+    )
+
+
+# ---------------------------------------------------------------------------
+# @batch_feature_view — interactions
+#
+# Reads raw reviews -> produces user-item interaction pairs for training.
+# label = 1.0 when rating >= 4, else 0.0 (implicit positive signal).
+# Written to both online (Redis) and offline (S3) stores.
+# online=True required because materialize_incremental skips online=False views.
+# ---------------------------------------------------------------------------
+
+
+@batch_feature_view(
+    name="interactions",
+    entities=[user, item],
+    ttl=timedelta(days=3650),
+    schema=[
+        Field(name="label", dtype=Float64),
+    ],
+    source=interactions_source,
+    mode=TransformationMode.PYTHON,
+    online=True,
+    offline=True,
+)
+def interactions(df):
+    from pyspark.sql import functions as F
+
+    if "asin" in df.columns and "parent_asin" not in df.columns:
+        df = df.withColumnRenamed("asin", "parent_asin")
+
+    return (
+        df.select(
+            F.col("user_id"),
+            F.col("parent_asin").alias("item_id"),
+            F.when(F.col("rating") >= 4, 1.0).otherwise(0.0).alias("label"),
+            F.col("event_timestamp"),
+        )
     )
