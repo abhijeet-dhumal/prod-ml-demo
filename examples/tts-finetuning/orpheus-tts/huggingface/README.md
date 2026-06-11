@@ -76,7 +76,7 @@ Orpheus frames TTS as **causal LM over SNAC audio tokens**: Turkish text → con
 
 ## How this model was trained
 
-End-to-end pipeline (reproducible from [GitHub manifests](https://github.com/redhat-data-and-ai/smartshop-ai/tree/main/examples/tts-finetuning/orpheus-tts)):
+End-to-end pipeline (reproducible from [GitHub manifests](https://github.com/abhijeet-dhumal/oai-tts-finetuning/tree/main/orpheus-tts)):
 
 | Step | What | Config / script |
 |------|------|-----------------|
@@ -289,8 +289,8 @@ out = model.generate(torch.tensor([prompt]).cuda(), max_new_tokens=1500, min_new
 ## Reproduction
 
 ```bash
-git clone https://github.com/redhat-data-and-ai/smartshop-ai.git
-cd smartshop-ai/examples/tts-finetuning/orpheus-tts
+git clone https://github.com/abhijeet-dhumal/oai-tts-finetuning.git
+cd oai-tts-finetuning/orpheus-tts
 
 # ConfigMap (scripts) + PVC
 oc kustomize . | oc apply -f - -n <namespace>
@@ -318,6 +318,7 @@ oc apply -f manifests/trainjob-orpheus-eval.yaml
 
 | Artifact | Link |
 |----------|------|
+| Source code | [github.com/abhijeet-dhumal/oai-tts-finetuning](https://github.com/abhijeet-dhumal/oai-tts-finetuning) |
 | Eval metrics | [`eval/eval_results.json`](eval/eval_results.json) |
 | Curated audio index | [`eval/samples_manifest.json`](eval/samples_manifest.json) |
 | MLflow exports | [`eval/mlflow/`](eval/mlflow/) |

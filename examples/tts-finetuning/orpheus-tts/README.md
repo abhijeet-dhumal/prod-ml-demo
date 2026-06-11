@@ -4,6 +4,7 @@ Fine-tune [unsloth/orpheus-3b-0.1-pretrained](https://huggingface.co/unsloth/orp
 
 | Deliverable | Link |
 |-------------|------|
+| **Source code** | [abhijeet-dhumal/oai-tts-finetuning](https://github.com/abhijeet-dhumal/oai-tts-finetuning/tree/main/orpheus-tts) |
 | **Fine-tuned weights** | [AbDhumal/orpheus-3b-turkish-tts-v2](https://huggingface.co/AbDhumal/orpheus-3b-turkish-tts-v2) |
 | **Model card source** | [`huggingface/README.md`](huggingface/README.md) |
 | **Architecture deep-dive** | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
@@ -65,7 +66,8 @@ Adjust `namespace`, queue name, and MLflow URI in manifests for your environment
 ### 1. ConfigMap + PVC
 
 ```bash
-cd examples/tts-finetuning/orpheus-tts
+git clone https://github.com/abhijeet-dhumal/oai-tts-finetuning.git
+cd oai-tts-finetuning/orpheus-tts
 kubectl kustomize . | oc apply -f - -n <namespace>
 ```
 
@@ -134,4 +136,5 @@ kubectl kustomize . | oc apply -f - -n <namespace>
 
 ## Related
 
+- GitHub repo: [abhijeet-dhumal/oai-tts-finetuning](https://github.com/abhijeet-dhumal/oai-tts-finetuning)
 - Hugging Face model: [AbDhumal/orpheus-3b-turkish-tts-v2](https://huggingface.co/AbDhumal/orpheus-3b-turkish-tts-v2)
