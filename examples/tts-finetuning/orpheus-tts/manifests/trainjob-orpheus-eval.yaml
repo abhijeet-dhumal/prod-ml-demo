@@ -1,0 +1,124 @@
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: orpheus-turkish-tts-eval
+  namespace: smartshop
+  labels:
+    app: orpheus-turkish-tts-eval
+    kueue.x-k8s.io/queue-name: smartshop-training
+spec:
+  labels:
+    kueue.x-k8s.io/queue-name: smartshop-training
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: ClusterTrainingRuntime
+    name: torch-distributed-cuda130-torch210-py312
+  trainer:
+    numNodes: 1
+    numProcPerNode: "gpu"
+    resourcesPerNode:
+      requests:
+        cpu: "8"
+        memory: "48Gi"
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "16"
+        memory: "64Gi"
+        nvidia.com/gpu: "1"
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        DEPS=/data/orpheus/deps-v2
+        export PYTHONPATH=$DEPS:${PYTHONPATH:-}
+
+        FINAL=/data/orpheus/checkpoints/turkish-v2/final
+        if [ ! -f "$FINAL/model.safetensors.index.json" ]; then
+          echo "ERROR: $FINAL not found — run save_final_orpheus.py first"
+          exit 1
+        fi
+
+        echo "=== Post-training eval on merged final/ (from checkpoint-8800) ==="
+        FINETUNED_MODEL="$FINAL" \
+        python /orpheus-scripts/evaluate_orpheus.py
+    env:
+      - name: BASE_MODEL
+        value: "unsloth/orpheus-3b-0.1-pretrained"
+      - name: HF_HOME
+        value: /data/orpheus/hf-cache
+      - name: WHISPER_MODEL
+        value: "small"
+      - name: EVAL_OUTPUT_DIR
+        value: /data/orpheus/eval-v4-final
+      - name: SKIP_MLFLOW_ARTIFACTS
+        value: "1"
+      - name: MLFLOW_RUN_NAME
+        value: eval-orpheus-tr-final
+      - name: MLFLOW_RUN_ID
+        value: ""
+      - name: MLFLOW_EXPERIMENT
+        value: orpheus-turkish-tts
+      - name: MLFLOW_TRACKING_URI
+        value: "https://rh-ai.apps.oai-kft-ibm.ibm.rh-ods.com/mlflow"
+      - name: MLFLOW_TRACKING_AUTH
+        value: "kubernetes-namespaced"
+      - name: MLFLOW_TRACKING_INSECURE_TLS
+        value: "true"
+      - name: MLFLOW_TRACKING_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: smartshop-mlflow-token
+            key: MLFLOW_TRACKING_TOKEN
+      - name: GEN_MAX_NEW_TOKENS
+        value: "1500"
+      - name: GEN_MIN_NEW_TOKENS
+        value: "80"
+      - name: GEN_TEMPERATURE
+        value: "0.3"
+      - name: GEN_TOP_P
+        value: "0.9"
+      - name: GEN_REPETITION_PENALTY
+        value: "1.15"
+      - name: GEN_TRIM_TOP_DB
+        value: "35"
+      - name: GEN_MIN_TOKENS_PER_CHAR
+        value: "7"
+      - name: GEN_BASELINE_MAX_NEW_CAP
+        value: "400"
+      - name: PYTORCH_CUDA_ALLOC_CONF
+        value: "expandable_segments:True"
+      - name: HF_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: hf-credentials
+            key: token
+
+  podTemplateOverrides:
+    - targetJobs:
+        - name: node
+      spec:
+        serviceAccountName: smartshop-training
+        nodeSelector:
+          nvidia.com/gpu.present: "true"
+        containers:
+          - name: node
+            volumeMounts:
+              - name: data
+                mountPath: /data
+              - name: orpheus-scripts
+                mountPath: /orpheus-scripts
+              - name: shm
+                mountPath: /dev/shm
+        volumes:
+          - name: data
+            persistentVolumeClaim:
+              claimName: orpheus-tts-storage
+          - name: orpheus-scripts
+            configMap:
+              name: orpheus-tts-scripts
+              defaultMode: 0755
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: "8Gi"
